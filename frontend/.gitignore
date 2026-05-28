@@ -1,0 +1,10 @@
+﻿node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+.vite/
+*.log
+.DS_Store
+tsconfig.tsbuildinfo
+.playwright-cli/
