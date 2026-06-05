@@ -19,7 +19,8 @@ export function splitIntoChunks(text: string, fileName: string, conceptMap: Know
     .split(/\n(?=#{1,3}\s+)/g)
     .map((section) => section.trim())
     .filter(Boolean);
-  const fallbackSections = sections.length > 0 ? sections : text.match(/[\s\S]{1,900}/g) ?? [];
+  const rawSections = sections.length > 0 ? sections : [text.trim()];
+  const fallbackSections = rawSections.flatMap((section) => section.match(/[\s\S]{1,900}/g) ?? []).slice(0, 80);
   return fallbackSections.map((section, index) => {
     const titleMatch = section.match(/^#{1,3}\s+(.+)$/m);
     const title = titleMatch?.[1]?.trim() || `片段 ${index + 1}`;
@@ -29,8 +30,11 @@ export function splitIntoChunks(text: string, fileName: string, conceptMap: Know
       .slice(0, 8);
     return {
       id: `${fileName.replace(/\W+/g, "_")}_chunk_${index + 1}`,
+      index,
       section: title,
       content: section,
+      text: section,
+      sourceTitle: fileName,
       concepts,
       source: { document: fileName, section: title, chunkId: `${fileName}_chunk_${index + 1}` }
     };

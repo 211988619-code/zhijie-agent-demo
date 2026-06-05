@@ -1,4 +1,4 @@
-import { CalendarCheck, CheckCircle2 } from "lucide-react";
+﻿import { CalendarCheck, CheckCircle2 } from "lucide-react";
 import type { ConceptId, ReviewTask } from "../types";
 
 type Props = {
@@ -22,7 +22,7 @@ export function ReviewTaskPanel({ reviewTasks, onOpenCard, onStartReviewCheck }:
       </div>
 
       {reviewTasks.length === 0 ? (
-        <div className="trace-empty">点击知识卡片或回答下方的“加入复习”后，会在这里生成今日复习任务。</div>
+        <div className="trace-empty">点击知识点或卡片的“加入复习”后，会在这里生成今日复习任务。</div>
       ) : (
         <div className="review-panel-list">
           {reviewTasks.map((task) => (
@@ -33,12 +33,13 @@ export function ReviewTaskPanel({ reviewTasks, onOpenCard, onStartReviewCheck }:
                   {task.category || "未分类"} · {task.dueDate}
                   {task.completedAt ? ` · 完成于 ${task.completedAt.slice(11, 16)}` : ""}
                   {task.lastCheckPassed === false ? " · 上次检测未通过" : ""}
+                  {task.reason ? ` · ${task.reason}` : ""}
                 </span>
               </button>
               <span className={`source-chip ${task.status === "done" ? "done" : ""}`}>{task.status === "done" ? "已完成" : "待复习"}</span>
               <button className="secondary-button small" disabled={task.status === "done"} onClick={() => onStartReviewCheck(task.id)}>
                 <CheckCircle2 size={14} />
-                {task.status === "done" ? "已完成" : "开始检测"}
+                {task.status === "done" ? "已完成" : "知识检测"}
               </button>
             </article>
           ))}

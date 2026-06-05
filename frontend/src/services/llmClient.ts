@@ -15,6 +15,8 @@ import type {
 import { initialCards } from "../data/demoCourse";
 import { conceptIdFromName, getMasteryLevel } from "./masteryService";
 import { buildFallbackKnowledgeCard, normalizeCard } from "./knowledgeCardService";
+import type { RetrievalResult } from "./retrievalService";
+import { describeRetrievalResult } from "./retrievalService";
 
 export type StructuredLLMResult = {
   answer: AgentAnswer;
@@ -39,7 +41,7 @@ export type GenerateKnowledgeCardParams = {
 const providerDefaults: Record<string, { baseUrl: string; model: string }> = {
   openai: { baseUrl: "https://api.openai.com/v1", model: "gpt-4o-mini" },
   deepseek: { baseUrl: "https://api.deepseek.com", model: "deepseek-v4-flash" },
-  dashscope: { baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus" },
+  dashscope: { baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "GLM-5" },
   zhipu: { baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash" },
   "openai-compatible": { baseUrl: "", model: "" }
 };
@@ -52,15 +54,34 @@ function sourceRefsFromChunks(chunks: CourseChunk[]): SourceRef[] {
   return chunks.slice(0, 3).map((chunk) => chunk.source);
 }
 
-function buildPrompt(question: string, chunks: CourseChunk[], concepts: KnowledgeConcept[], mastery: MasteryRecord[]) {
-  const contextText = chunks
+function sourceRefsFromRetrieval(results: RetrievalResult[] | undefined, fallbackChunks: CourseChunk[]): SourceRef[] {
+  if (!results || results.length === 0) return sourceRefsFromChunks(fallbackChunks);
+  return results.map((result) => ({
+    document: result.chunk.sourceTitle ?? result.chunk.source?.document ?? "current document",
+    section: result.chunk.section ?? `chunk ${(result.chunk.index ?? 0) + 1}`,
+    chunkId: result.chunk.id
+  }));
+}
+
+function buildPrompt(question: string, chunks: CourseChunk[], concepts: KnowledgeConcept[], mastery: MasteryRecord[], contextChunks?: RetrievalResult[]) {
+  const selectedChunks = contextChunks && contextChunks.length > 0 ? contextChunks.map((result) => result.chunk) : chunks.slice(0, 6);
+  const contextText = selectedChunks
     .slice(0, 6)
-    .map((chunk, index) => `[${index + 1}] ${chunk.source.document} / ${chunk.section}\n${chunk.content.slice(0, 1200)}`)
+    .map((chunk, index) => `[chunk ${index + 1} | ${chunk.sourceTitle ?? chunk.source.document} | index ${(chunk.index ?? index) + 1}]\n${(chunk.text ?? chunk.content).slice(0, 1400)}`)
     .join("\n\n");
+  const contextNotice =
+    contextChunks && contextChunks.length > 0
+      ? contextChunks.some((result) => result.fallback)
+        ? "No strong matching material was found. The context below uses the first document chunks as weak fallback context. Say this clearly if the material is insufficient."
+        : "The context below was retrieved from the current course material. Prioritize it when answering."
+      : "No course material context is available for this question. Answer as general chat if needed.";
   const conceptText = concepts.map((concept) => `${concept.name}（${concept.category}，${concept.status}）`).join("、");
   const masteryText = mastery.map((item) => `${item.conceptName}: ${item.score.toFixed(2)} ${getMasteryLevel(item.score)}`).join("\n");
 
-  return `你是“知阶 Agent”，面向高校学生的自适应学习与复习助手。请基于课程资料、知识点和学生画像回答问题。
+  return `You are ZhiJie Agent, an AI learning assistant for university courses.
+When course material chunks are provided, prioritize them. If the chunks do not contain enough evidence, explicitly say "?????????????" before using general knowledge.
+Do not invent citations or claim that the material contains something it does not contain.
+${contextNotice}
 
 用户问题：
 ${question}
@@ -322,6 +343,11 @@ function isDeepSeekV4(config: LLMConfig, model: string) {
   return config.provider === "deepseek" && /^deepseek-v4-(pro|flash)$/i.test(model);
 }
 
+function normalizeRequestModel(config: LLMConfig, model: string) {
+  if (config.provider === "dashscope" && /^GLM-5$/i.test(model)) return "glm-5";
+  return model;
+}
+
 function buildRequestBody(config: LLMConfig, model: string, messages: Array<{ role: string; content: string }>, maxTokens?: number) {
   const body: Record<string, unknown> = {
     model,
@@ -336,20 +362,27 @@ function buildRequestBody(config: LLMConfig, model: string, messages: Array<{ ro
     // so disable thinking to avoid responses with reasoning_content but empty content.
     body.thinking = { type: "disabled" };
   } else {
-    body.temperature = 0.3;
+    body.temperature = config.temperature ?? 0.3;
   }
 
   return body;
 }
 
 function getChatCompletionsUrl(config: LLMConfig, baseUrl: string, model: string) {
-  const normalizedBaseUrl = baseUrl.replace(/\/$/, "");
+  const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
+  if (/\/chat\/completions$/i.test(normalizedBaseUrl)) return normalizedBaseUrl;
   if (isDeepSeekV4(config, model) && /^https:\/\/api\.deepseek\.com\/v1\/?$/i.test(normalizedBaseUrl)) {
     return "https://api.deepseek.com/chat/completions";
   }
   return `${normalizedBaseUrl}/chat/completions`;
 }
 
+function formatHttpError(status: number, message: string) {
+  if (status === 401) return `401 Unauthorized: invalid or unauthorized API Key. ${message}`;
+  if (status === 404) return `404 Not Found: Base URL or model may be wrong. ${message}`;
+  if (status === 429) return `429 Rate Limit: too many requests or insufficient quota. ${message}`;
+  return `HTTP ${status}: ${message}`;
+}
 function extractErrorMessage(json: unknown): string | null {
   if (!json || typeof json !== "object") return null;
   const data = json as Record<string, unknown>;
@@ -364,29 +397,37 @@ function extractErrorMessage(json: unknown): string | null {
 
 async function postChatCompletions(config: LLMConfig, messages: Array<{ role: string; content: string }>, maxTokens?: number) {
   const defaults = getProviderDefaults(config.provider);
-  const baseUrl = (config.baseUrl || defaults.baseUrl).replace(/\/$/, "");
-  const model = config.model || defaults.model;
-  if (!baseUrl || !model) throw new Error("请填写 Base URL 和 Model Name。");
+  const baseUrl = (config.baseUrl || defaults.baseUrl).trim().replace(/\/+$/, "");
+  const model = normalizeRequestModel(config, config.model || defaults.model);
+  if (!baseUrl || !model) throw new Error("Missing Base URL or Model Name.");
 
-  const response = await fetch(getChatCompletionsUrl(config, baseUrl, model), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`
-    },
-    body: JSON.stringify(buildRequestBody(config, model, messages, maxTokens))
-  });
+  let response: Response;
+  try {
+    response = await fetch(getChatCompletionsUrl(config, baseUrl, model), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`
+      },
+      body: JSON.stringify(buildRequestBody(config, model, messages, maxTokens))
+    });
+  } catch (error) {
+    throw new Error(
+      `Network/CORS Error: request did not reach the model service. Browser direct access may be blocked by CORS; use a backend proxy later. ${error instanceof Error ? error.message : ""}`
+    );
+  }
+
   const rawText = await response.text();
   let json: unknown;
   try {
     json = JSON.parse(rawText);
   } catch {
-    throw new Error(`模型返回非 JSON：${rawText.slice(0, 240)}`);
+    throw new Error(`Model returned non-JSON response: ${rawText.slice(0, 240)}`);
   }
 
   const errorMessage = extractErrorMessage(json);
   if (!response.ok || errorMessage) {
-    throw new Error(`模型请求失败：${response.status} ${errorMessage ?? rawText.slice(0, 240)}`);
+    throw new Error(formatHttpError(response.status, errorMessage ?? rawText.slice(0, 240)));
   }
 
   const data = json as Record<string, any>;
@@ -394,12 +435,11 @@ async function postChatCompletions(config: LLMConfig, messages: Array<{ role: st
   const content = message?.content;
   const reasoningContent = message?.reasoning_content;
   if ((!content || typeof content !== "string") && reasoningContent) {
-    throw new Error("模型返回了 reasoning_content 但没有最终 content。DeepSeek V4 thinking mode 可能未关闭，或输出 token 不足。");
+    throw new Error("Model returned reasoning_content but no final content. Thinking mode or token limit may be the cause.");
   }
-  if (!content || typeof content !== "string") throw new Error("模型返回格式缺少 choices[0].message.content。");
+  if (!content || typeof content !== "string") throw new Error("Model response is empty: missing choices[0].message.content.");
   return content;
 }
-
 function sourceLabel(source?: GenerateKnowledgeCardParams["source"]) {
   if (source === "chat") return "由问答中新概念生成";
   if (source === "quiz") return "由习题生成中新概念生成";
@@ -528,31 +568,73 @@ export async function callLLMAgent(
   question: string,
   chunks: CourseChunk[],
   concepts: KnowledgeConcept[],
-  mastery: MasteryRecord[]
+  mastery: MasteryRecord[],
+  contextChunks?: RetrievalResult[]
 ): Promise<StructuredLLMResult> {
   if (!config.apiKey.trim()) {
-    if (config.useMockFallback) return buildMockAgentResponse(question, chunks, concepts, mastery, "未填写 API Key，使用 mock fallback。");
-    throw new Error("请先填写 API Key，或启用 mock fallback。");
+    if (config.useMockFallback) return buildMockAgentResponse(question, chunks, concepts, mastery, "Missing API Key, using mock fallback.");
+    throw new Error("Please configure API Key in Settings, or enable mock fallback.");
   }
 
   try {
+    const materialTrace: AgentTraceStep | null = contextChunks
+      ? {
+          id: `materials_${Date.now()}`,
+          title: contextChunks.length > 0 ? "Materials Retriever" : "Materials Retriever: no chunks",
+          type: "retrieval",
+          status: "success",
+          detail:
+            contextChunks.length > 0
+              ? `Using ${contextChunks.length} chunk(s): ${contextChunks.map(describeRetrievalResult).join("; ")}`
+              : "No material context injected; using normal chat.",
+          data: contextChunks.map((result) => describeRetrievalResult(result))
+        }
+      : null;
     const content = await postChatCompletions(config, [
-      { role: "system", content: "你是严谨的学习 Agent。除非另有要求，否则只输出合法 JSON。" },
-      { role: "user", content: buildPrompt(question, chunks, concepts, mastery) }
+      { role: "system", content: "You are a strict learning Agent. Return valid JSON unless the user explicitly asks otherwise." },
+      { role: "user", content: buildPrompt(question, chunks, concepts, mastery, contextChunks) }
     ]);
+    const realApiTrace: AgentTraceStep = {
+      id: `real_api_${Date.now()}`,
+      title: "Real API",
+      type: "llm_call",
+      status: "success",
+      detail: `${config.provider} / ${config.model || getProviderDefaults(config.provider).model}`
+    };
     try {
-      return normalizeLLMResult(extractJson(content), "llm", sourceRefsFromChunks(chunks));
+      const result = normalizeLLMResult(extractJson(content), "llm", sourceRefsFromRetrieval(contextChunks, chunks));
+      result.trace = [realApiTrace, ...(materialTrace ? [materialTrace] : []), ...result.trace];
+      return result;
     } catch {
-      return fallbackFromPlainText(content, sourceRefsFromChunks(chunks));
+      const result = fallbackFromPlainText(content, sourceRefsFromRetrieval(contextChunks, chunks));
+      result.trace = [realApiTrace, ...(materialTrace ? [materialTrace] : []), ...result.trace];
+      return result;
     }
   } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown API error";
     if (config.useMockFallback) {
-      return buildMockAgentResponse(question, chunks, concepts, mastery, `真实 LLM 调用失败，已 fallback：${error instanceof Error ? error.message : "未知错误"}`);
+      const result = buildMockAgentResponse(question, chunks, concepts, mastery, `Real API failed, fallback to Mock: ${message}`);
+      result.trace = [
+        { id: `api_error_${Date.now()}`, title: "API Error -> Mock fallback", type: "llm_call", status: "failed", detail: message },
+        ...(contextChunks && contextChunks.length > 0
+          ? [
+              {
+                id: `materials_${Date.now()}`,
+                title: "Materials Retriever",
+                type: "retrieval",
+                status: "success",
+                detail: `Using ${contextChunks.length} chunk(s): ${contextChunks.map(describeRetrievalResult).join("; ")}`,
+                data: contextChunks.map((result) => describeRetrievalResult(result))
+              } as AgentTraceStep
+            ]
+          : []),
+        ...result.trace
+      ];
+      return result;
     }
     throw error;
   }
 }
-
 export async function callQuizLLM(
   config: LLMConfig,
   concepts: KnowledgeConcept[],

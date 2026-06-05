@@ -12,6 +12,10 @@ export type CourseChunk = {
   content: string;
   concepts: ConceptId[];
   source: SourceRef;
+  index?: number;
+  sourceTitle?: string;
+  text?: string;
+  keywords?: string[];
 };
 
 export type KnowledgeConcept = {
@@ -106,7 +110,10 @@ export type LLMConfig = {
   baseUrl?: string;
   model: string;
   useMockFallback: boolean;
+  temperature?: number;
 };
+
+export type ModelConnectionStatus = "missing-key" | "mock" | "ready" | "error" | "testing";
 
 export type DetectedConcept = {
   name: string;
@@ -188,9 +195,11 @@ export type QuizResultChange = {
 export type ReviewTask = {
   id: string;
   conceptName: string;
+  title?: string;
+  reason?: string;
   category?: string;
   dueDate: string;
-  source: "knowledge_card" | "chat_suggestion" | "quiz";
+  source: "knowledge_card" | "chat_suggestion" | "quiz" | "material" | "knowledge-card" | "mistake" | "mastery";
   status: "pending" | "done";
   createdAt: string;
   completedAt?: string;

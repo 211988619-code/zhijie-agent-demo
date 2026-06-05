@@ -1,10 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle, BookOpenCheck, CalendarCheck, Compass, GraduationCap, LayoutDashboard, Layers3, LogOut, MessageSquarePlus, Moon, Plus, RotateCcw, Settings, Sun, Trash2 } from "lucide-react";
 import { AgentTracePanel } from "./components/AgentTracePanel";
 import { ChatWindow } from "./components/ChatWindow";
+import { FeatureCard } from "./components/common/FeatureCard";
+import { DashboardPage } from "./components/dashboard/DashboardPage";
 import { DocumentPanel } from "./components/DocumentPanel";
 import { KnowledgeCardDrawer } from "./components/KnowledgeCardDrawer";
+import { AppShell } from "./components/layout/AppShell";
+import { Header } from "./components/layout/Header";
+import { RightSummaryPanel } from "./components/layout/RightSummaryPanel";
+import { Sidebar, type WorkspaceTab } from "./components/layout/Sidebar";
+import { MaterialsPage } from "./components/materials/MaterialsPage";
 import { MasteryPanel } from "./components/MasteryPanel";
 import { MistakeBookPanel } from "./components/MistakeBookPanel";
 import { MistakesPage } from "./components/MistakesPage";
@@ -25,6 +32,7 @@ import type {
   KnowledgeConcept,
   LearningSpace,
   LLMConfig,
+  ModelConnectionStatus,
   MasteryEvent,
   MistakeItem,
   ParsedDocument,
@@ -39,6 +47,7 @@ import type {
 } from "./types";
 import { canonicalizeConceptName } from "./services/conceptIdentity";
 import { classifyConceptFallback, reconcileKnowledgeState, toCandidateConcept, upsertCandidateConcept } from "./services/knowledgeStateService";
+import { retrieveRelevantChunks, type RetrievalResult } from "./services/retrievalService";
 
 type RightPanelMode = "trace" | "mistakes" | "review" | "modelConfig";
 type QuizDifficultySelection = "all" | QuizDifficulty;
@@ -49,8 +58,13 @@ type CrossPageNoticeState = {
   workbenchUnread: boolean;
   spacesUnread: boolean;
 };
+type QuizGenerationProgress = {
+  conceptName: string;
+  activeIndex: number;
+  sourceLabel?: string;
+};
 
-const demoQuestion = "为什么神经网络的反向传播需要用到链式法则？请用公式解释。";
+const demoQuestion = "为什么神经网络的反向传播需要链式法则？请用公式解释。";
 const today = () => new Date().toISOString().slice(0, 10);
 const now = () => new Date().toISOString();
 
@@ -218,12 +232,16 @@ function AppSwitchMenu({
   );
 }
 
+
+const MODEL_CONFIG_STORAGE_KEY = "learning-agent-model-config";
+
 const defaultConfig: LLMConfig = {
-  provider: "openai-compatible",
+  provider: "dashscope",
   apiKey: "",
-  baseUrl: getProviderDefaults("openai-compatible").baseUrl,
-  model: "gpt-4o-mini",
-  useMockFallback: true
+  baseUrl: getProviderDefaults("dashscope").baseUrl,
+  model: getProviderDefaults("dashscope").model,
+  useMockFallback: true,
+  temperature: 0.3
 };
 
 const demoAnswers: Record<string, QuizAnswer> = {
@@ -307,6 +325,7 @@ export default function App() {
   const [candidateInitialScores, setCandidateInitialScores] = useState<Record<string, number>>({});
   const [rightPanelMode, setRightPanelMode] = useState<RightPanelMode>("trace");
   const [activePage, setActivePageState] = useState<AppPage>(() => appPageFromPath(window.location.pathname));
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTab>("dashboard");
   const [learningSpaces, setLearningSpaces] = useState<LearningSpace[]>(() => readLocal("learningSpaces", defaultLearningSpaces));
   const [agentSessions, setAgentSessions] = useState<AgentSession[]>(() =>
     normalizeAgentSessionsForSpaces(readLocal("learningSpaces", defaultLearningSpaces), readLocal<AgentSession[]>("agentSessions", defaultAgentSessions))
@@ -334,8 +353,10 @@ export default function App() {
   const generatingSessionIdsRef = useRef(new Set<string>());
   const appMenuCloseTimerRef = useRef<number | null>(null);
 
-  const [config, setConfig] = useState<LLMConfig>(defaultConfig);
-  const [connected, setConnected] = useState(false);
+  const [config, setConfig] = useState<LLMConfig>(() => ({ ...defaultConfig, ...readLocal<Partial<LLMConfig>>(MODEL_CONFIG_STORAGE_KEY, {}) }));
+  const [modelStatus, setModelStatus] = useState<ModelConnectionStatus>(() => (readLocal<Partial<LLMConfig>>(MODEL_CONFIG_STORAGE_KEY, {}).apiKey ? "mock" : "missing-key"));
+  const [lastModelError, setLastModelError] = useState("");
+  const connected = modelStatus === "ready";
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: "welcome",
@@ -344,6 +365,7 @@ export default function App() {
     }
   ]);
   const [trace, setTrace] = useState<AgentTraceStep[]>([]);
+  const [lastRetrievalResults, setLastRetrievalResults] = useState<RetrievalResult[]>([]);
   const [input, setInput] = useState(demoQuestion);
   const [activeCard, setActiveCard] = useState<string | null>(null);
   const [secondaryCard, setSecondaryCard] = useState<string | null>(null);
@@ -365,6 +387,8 @@ export default function App() {
   const [quizChanges, setQuizChanges] = useState<QuizResultChange[]>(() => readLocal("quizChanges", []));
   const [quizWarning, setQuizWarning] = useState("");
   const [quizDifficultyHint, setQuizDifficultyHint] = useState("");
+  const [quizSummary, setQuizSummary] = useState("");
+  const [quizGenerationProgress, setQuizGenerationProgress] = useState<QuizGenerationProgress | null>(null);
   const [quizCollapsed, setQuizCollapsed] = useState(() => readLocal("quizCollapsed", false));
   const [quizSource, setQuizSource] = useState<"diagnosis" | "knowledge_check" | "review_task">("diagnosis");
   const [activeReviewTaskId, setActiveReviewTaskId] = useState<string | null>(null);
@@ -446,6 +470,7 @@ export default function App() {
   useEffect(() => writeLocal("agentSessionInputs", sessionInputs), [sessionInputs]);
   useEffect(() => writeLocal("agentSessionTrace", sessionTrace), [sessionTrace]);
   useEffect(() => writeLocal("lastVisitedMainPage", lastVisitedMainPage), [lastVisitedMainPage]);
+  useEffect(() => writeLocal(MODEL_CONFIG_STORAGE_KEY, config), [config]);
 
   const categories = useMemo(() => Array.from(new Set(cards.map((card) => card.category))), [cards]);
   const drawerCards = useMemo(() => upsertCards(cards, temporaryCards), [cards, temporaryCards]);
@@ -474,12 +499,12 @@ export default function App() {
     const relationIds = new Set(spaceConcepts.filter((item) => item.spaceId === activeLearningSpace.id).map((item) => normalizeConceptName(item.conceptId)));
     const spaceName = activeLearningSpace.name;
     const keywordMap: Record<string, string[]> = {
-      高等数学: ["导数", "链式法则", "函数", "矩阵", "概率"],
-      机器学习基础: ["梯度", "损失函数", "过拟合", "正则化", "SVM", "PCA"],
-      深度学习: ["CNN", "RNN", "反向传播", "梯度", "损失函数", "激活函数", "链式法则", "矩阵乘法", "Transformer"],
-      强化学习: ["MDP", "Q-learning", "PPO", "策略", "价值函数", "强化学习"],
-      计算机视觉: ["CNN", "卷积", "ResNet", "图像", "视觉"],
-      自然语言处理: ["Transformer", "BERT", "GPT", "注意力", "语言模型"]
+      "高等数学": ["导数", "链式法则", "函数", "矩阵", "概率"],
+      "机器学习基础": ["梯度", "损失函数", "过拟合", "正则化", "SVM", "PCA"],
+      "深度学习": ["CNN", "RNN", "反向传播", "梯度", "损失函数", "激活函数", "链式法则", "矩阵乘法", "Transformer"],
+      "强化学习": ["MDP", "Q-learning", "PPO", "策略", "价值函数", "强化学习"],
+      "计算机视觉": ["CNN", "卷积", "ResNet", "图像", "视觉"],
+      "自然语言处理": ["Transformer", "BERT", "GPT", "注意力", "语言模型"]
     };
     const keywords = keywordMap[spaceName] ?? [];
     const matched = concepts.filter((concept) => {
@@ -499,6 +524,17 @@ export default function App() {
     window.setTimeout(() => setToast(""), 1800);
   };
 
+  const appendTraceSteps = (steps: Omit<AgentTraceStep, "id">[]) => {
+    const timestamp = Date.now();
+    setTrace((current) => [
+      ...steps.map((step, index) => ({
+        id: `local_trace_${timestamp}_${index}`,
+        ...step
+      })),
+      ...current
+    ]);
+  };
+
   const addPendingCandidate = (
     candidate: { name: string; category?: string; reason?: string; source?: CandidateConcept["source"] },
     source: CandidateConcept["source"] = "chat"
@@ -516,8 +552,78 @@ export default function App() {
     showToast("已清除候选知识点");
   };
 
+  const removeConceptFromMaterials = (item: KnowledgeConcept | CandidateConcept) => {
+    const name = "name" in item ? item.name : item.canonicalName;
+    const canonical = canonicalizeConceptName(name, [...concepts, ...pendingCandidates]);
+    const normalized = canonical.normalizedKey;
+    const confirmed = concepts.some((concept) => (concept.normalizedKey || normalizeConceptName(concept.name)) === normalized);
+    const message = confirmed
+      ? `Remove "${canonical.canonicalName}" from the current knowledge base? The related card will be removed, while mastery records stay.`
+      : `Ignore candidate concept "${canonical.canonicalName}"?`;
+    if (!window.confirm(message)) return;
+
+    setConcepts((current) => {
+      const next = current.filter((concept) => (concept.normalizedKey || normalizeConceptName(concept.name)) !== normalized);
+      conceptNameSetRef.current = new Set(next.map((concept) => concept.normalizedKey || normalizeConceptName(concept.name)));
+      return next;
+    });
+    setPendingCandidates((current) => current.filter((candidate) => candidate.normalizedKey !== normalized));
+    setCards((current) => current.filter((card) => (card.normalizedKey || normalizeConceptName(card.name)) !== normalized));
+    setTemporaryCards((current) => current.filter((card) => (card.normalizedKey || normalizeConceptName(card.name)) !== normalized));
+    setDismissedCandidateNames((current) => (current.includes(normalized) ? current : [...current, normalized]));
+    showToast(confirmed ? `Removed from knowledge base: ${canonical.canonicalName}` : `Ignored candidate concept: ${canonical.canonicalName}`);
+  };
+
+  const removeKnowledgeCardFromMaterials = (card: KnowledgeCard) => {
+    const normalized = card.normalizedKey || normalizeConceptName(card.name);
+    if (!window.confirm(`Delete knowledge card "${card.name}"? The concept and mastery records will stay.`)) return;
+    setCards((current) => current.filter((item) => item.id !== card.id && (item.normalizedKey || normalizeConceptName(item.name)) !== normalized));
+    setTemporaryCards((current) => current.filter((item) => item.id !== card.id && (item.normalizedKey || normalizeConceptName(item.name)) !== normalized));
+    showToast(`Deleted knowledge card: ${card.name}`);
+  };
+
+  const confirmCandidateFromMaterials = (candidate: CandidateConcept) => {
+    void addCandidateToCourseKnowledge(
+      candidate.canonicalName,
+      candidate.suggestedCategory ?? "Uncategorized",
+      candidate.reason ?? candidate.summary ?? "Confirmed from Materials page",
+      0.2,
+      undefined,
+      candidate.source
+    ).then(() => {
+      showToast(`Added to knowledge base: ${candidate.canonicalName}`);
+    });
+  };
+
+  const rejectCandidateConcept = (candidate: CandidateConcept) => {
+    dismissCandidate(candidate);
+    showToast(`Ignored candidate concept: ${candidate.canonicalName}`);
+  };
+
+  const restoreDemoDocument = () => {
+    setParsedDocument(builtInDocument);
+    showToast("Restored built-in demo material");
+  };
+
   const toggleRightPanel = (mode: Exclude<RightPanelMode, "trace">) => {
     setRightPanelMode((current) => (current === mode ? "trace" : mode));
+  };
+
+  const handleConfigChange = (next: LLMConfig) => {
+    setConfig(next);
+    setLastModelError("");
+    if (!next.apiKey.trim()) setModelStatus(next.useMockFallback ? "mock" : "missing-key");
+    else setModelStatus(next.useMockFallback ? "mock" : "missing-key");
+  };
+
+  const handleModelStatusChange = (status: ModelConnectionStatus, error = "") => {
+    setModelStatus(status);
+    setLastModelError(error);
+  };
+
+  const handleWorkspaceTabChange = (tab: WorkspaceTab) => {
+    setActiveWorkspaceTab(tab);
+    if (rightPanelMode === "modelConfig") setRightPanelMode("trace");
   };
 
   const navigatePage = (page: AppPage) => {
@@ -698,9 +804,9 @@ export default function App() {
   };
 
   const difficultyLabel = (difficulty: QuizDifficulty) => {
-    if (difficulty === "basic") return "基础";
-    if (difficulty === "medium") return "中等";
-    return "提高";
+    if (difficulty === "basic") return "鍩虹";
+    if (difficulty === "medium") return "涓瓑";
+    return "鎻愰珮";
   };
 
   const resolveQuizDifficulty = (
@@ -832,7 +938,7 @@ export default function App() {
     const cardName = canonical.canonicalName;
     const existingOfficial = cards.some((card) => (card.normalizedKey || normalizeConceptName(card.name)) === canonical.normalizedKey);
     if (!existingOfficial) {
-      showToast(`正在生成「${conceptName}」知识卡...`);
+      showToast(`正在生成「${conceptName}」知识卡片...`);
       await ensureKnowledgeCard(cardName, options);
     }
     setActiveCard(cardName);
@@ -848,7 +954,7 @@ export default function App() {
     const cardName = canonical.canonicalName;
     const existingOfficial = cards.some((card) => (card.normalizedKey || normalizeConceptName(card.name)) === canonical.normalizedKey);
     if (!existingOfficial) {
-      showToast(`正在生成「${conceptName}」知识卡...`);
+      showToast(`正在生成「${conceptName}」知识卡片...`);
       await ensureKnowledgeCard(cardName, {
         category: sourceCard?.category,
         source: sourceType,
@@ -905,9 +1011,10 @@ export default function App() {
 
   const isQuestionInMistakeBook = (question: QuizQuestion) => mistakes.some((item) => item.status === "active" && isSameMistakeQuestion(item, question));
 
-  const addMistake = (question: QuizQuestion, source: "diagnosis" | "review" | "practice" = "diagnosis") => {
+  const addMistake = (question: QuizQuestion, source: "diagnosis" | "review" | "practice" = "diagnosis", silent = false) => {
     const selected = selectedAnswers[question.id];
     const item = buildMistakeItemFromQuestion(question, selected, source);
+    const existed = isQuestionInMistakeBook(question);
     mistakeIdsRef.current.add(item.id);
     mistakeIdsRef.current.add(item.questionId);
     setMistakes((current) => {
@@ -915,8 +1022,8 @@ export default function App() {
       writeLocal("mistakeBook", next);
       return next;
     });
-    showToast("已收入错题本");
-    return true;
+    if (!silent) showToast(existed ? "错题已更新" : "已收入错题本");
+    return !existed;
   };
 
   const isConceptRelevantToActiveSpace = (conceptName: string, conceptCategory?: string) => {
@@ -966,29 +1073,42 @@ export default function App() {
   const isInReview = (conceptName: string) => {
     const normalized = canonicalizeConceptName(conceptName, [...concepts, ...pendingCandidates]).normalizedKey;
     const dueDate = today();
-    return reviewTasks.some((task) => (normalizeConceptName(task.conceptName) === normalized && task.dueDate === dueDate) || `${normalized}:${dueDate}` === task.id);
+    return reviewTasks.some(
+      (task) => task.status === "pending" && ((normalizeConceptName(task.conceptName) === normalized && task.dueDate === dueDate) || `${normalized}:${dueDate}` === task.id)
+    );
   };
 
-  const addReviewTask = (conceptName: string, source: "knowledge_card" | "chat_suggestion" | "quiz") => {
+  const createReviewTask = (
+    conceptName: string,
+    source: ReviewTask["source"],
+    options: { navigate?: boolean; toast?: boolean; reason?: string } = {}
+  ) => {
+    const shouldToast = options.toast ?? true;
     const canonical = canonicalizeConceptName(conceptName, [...concepts, ...pendingCandidates]);
     const confirmed = concepts.some((concept) => (concept.normalizedKey || normalizeConceptName(concept.name)) === canonical.normalizedKey);
     if (!confirmed) {
       addPendingCandidate({ name: conceptName, reason: "加入复习前需要先确认入库", source: "chat" }, "chat");
-      showToast("请先确认加入知识库，再加入复习任务");
-      return;
+      if (shouldToast) showToast("请先确认加入知识库，再加入复习任务");
+      return false;
     }
     const canonicalName = canonical.canonicalName;
     const dueDate = today();
     const key = `${canonical.normalizedKey}:${dueDate}`;
-    if (reviewTaskIdsRef.current.has(key)) {
-      showToast("已在今日复习中");
-      return;
+    const alreadyPending = reviewTasks.some(
+      (task) => task.status === "pending" && (task.id === key || normalizeConceptName(task.conceptName) === canonical.normalizedKey)
+    );
+    if (reviewTaskIdsRef.current.has(key) || alreadyPending) {
+      if (shouldToast) showToast("已在复习任务中");
+      if (options.navigate) setActiveWorkspaceTab("review");
+      return false;
     }
     reviewTaskIdsRef.current.add(key);
     const category = cards.find((card) => (card.normalizedKey || normalizeConceptName(card.name)) === canonical.normalizedKey)?.category || concepts.find((concept) => (concept.normalizedKey || normalizeConceptName(concept.name)) === canonical.normalizedKey)?.category;
     const task: ReviewTask = {
       id: key,
       conceptName: canonicalName,
+      title: `${canonicalName} 知识复习`,
+      reason: options.reason ?? "学习 Agent 安排复习",
       category,
       dueDate,
       source,
@@ -997,15 +1117,31 @@ export default function App() {
       masteryApplied: false
     };
     setReviewTasks((current) => (current.some((item) => item.id === key) ? current : [task, ...current]));
-    showToast("已加入今日复习");
+    appendTraceSteps([
+      { title: "Concept Selector", type: "review", status: "success", detail: `Selected concept: ${canonicalName}` },
+      { title: "Review Scheduler", type: "review", status: "success", detail: `Created review task for ${canonicalName}` },
+      { title: "State Tracker", type: "state", status: "success", detail: "reviewTasks updated" }
+    ]);
+    if (options.navigate) setActiveWorkspaceTab("review");
+    if (shouldToast) showToast(`已加入今日复习：${canonicalName}`);
+    return true;
+  };
+
+  const addReviewTask = (conceptName: string, source: "knowledge_card" | "chat_suggestion" | "quiz") => {
+    createReviewTask(conceptName, source, { navigate: true, toast: true, reason: source === "quiz" ? "检测答错后自动安排复习" : "用户手动加入今日复习" });
   };
 
   const startReviewTaskCheck = async (taskId: string) => {
     const task = reviewTasks.find((item) => item.id === taskId);
     if (!task || task.status === "done") return;
-    openDiagnosisPanelForCurrentPage();
+    setActiveWorkspaceTab("quiz");
     setQuizSource("review_task");
     setActiveReviewTaskId(taskId);
+    appendTraceSteps([
+      { title: "ReviewTask Reader", type: "review", status: "success", detail: `Loaded review task: ${task.conceptName}` },
+      { title: "Target Concept", type: "quiz", status: "success", detail: task.conceptName },
+      { title: "Task Router", type: "router", status: "success", detail: "Switched to Quiz tab" }
+    ]);
     await startKnowledgeCheck(task.conceptName, "review_task");
   };
 
@@ -1043,10 +1179,10 @@ export default function App() {
     setTrace([
       {
         id: `upload_${Date.now()}`,
-        title: "资料上传解析",
+        title: "璧勬枡涓婁紶瑙ｆ瀽",
         type: "document_parse",
         status: parsed.status === "failed" ? "failed" : "success",
-        detail: `${parsed.fileName}：提取 ${parsed.chunks.length} 个片段，抽取 ${parsed.concepts.length} 个知识点。`
+        detail: `${parsed.fileName}: 提取 ${parsed.chunks.length} 个片段，抽取 ${parsed.concepts.length} 个知识点。`
       }
     ]);
   };
@@ -1060,7 +1196,13 @@ export default function App() {
     setInput("");
     setMessages((current) => [...current, { id: studentId, role: "student", text: question }]);
     try {
-      const result = await callLLMAgent(config, question, parsedDocument.chunks, concepts, mastery);
+      const retrievalResults = retrieveRelevantChunks(question, parsedDocument.chunks ?? [], {
+        topK: 3,
+        maxTotalChars: 4000,
+        conceptNames: concepts.map((concept) => concept.name)
+      });
+      setLastRetrievalResults(retrievalResults);
+      const result = await callLLMAgent(config, question, parsedDocument.chunks, concepts, mastery, retrievalResults);
       setTrace(result.trace);
       const confirmedKeys = new Set(concepts.map((concept) => concept.normalizedKey || normalizeConceptName(concept.name)));
       const officialCards = result.cards.filter((card) => confirmedKeys.has(card.normalizedKey || normalizeConceptName(card.name)));
@@ -1068,7 +1210,15 @@ export default function App() {
       if (officialCards.length > 0) setCards((current) => upsertCards(current, officialCards.map((card) => ({ ...card, status: "confirmed" }))));
       if (temporaryResultCards.length > 0) setTemporaryCards((current) => upsertCards(current, temporaryResultCards.map((card) => ({ ...card, status: "temporary" }))));
       setMessages((current) => [...current, { id: agentId, role: "agent", answer: result.answer }]);
-      setConnected(result.answer.mode === "llm" || Boolean(config.apiKey.trim()));
+      if (result.answer.mode === "llm") {
+        setModelStatus("ready");
+        setLastModelError("");
+      } else if (config.apiKey.trim()) {
+        setModelStatus("error");
+        setLastModelError(result.trace.find((step) => step.title.includes("API Error"))?.detail ?? "Real API failed, using mock fallback.");
+      } else {
+        setModelStatus(config.useMockFallback ? "mock" : "missing-key");
+      }
       result.answer.detectedConcepts.forEach((concept) => {
         const canonical = canonicalizeConceptName(concept.name, [...concepts, ...pendingCandidates]);
         const exists = concepts.some((item) => (item.normalizedKey || normalizeConceptName(item.name)) === canonical.normalizedKey);
@@ -1082,9 +1232,12 @@ export default function App() {
         }
       });
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Model call failed";
+      setModelStatus("error");
+      setLastModelError(message);
       setMessages((current) => [
         ...current,
-        { id: `agent_error_${Date.now()}`, role: "agent", error: error instanceof Error ? error.message : "模型调用失败" }
+        { id: `agent_error_${Date.now()}`, role: "agent", error: message }
       ]);
     } finally {
       if (activePageRef.current !== "workbench") {
@@ -1151,7 +1304,15 @@ export default function App() {
         ...current,
         [sessionId]: [...(current[sessionId] ?? []), { id: agentId, role: "agent", answer: result.answer }]
       }));
-      setConnected(result.answer.mode === "llm" || Boolean(config.apiKey.trim()));
+      if (result.answer.mode === "llm") {
+        setModelStatus("ready");
+        setLastModelError("");
+      } else if (config.apiKey.trim()) {
+        setModelStatus("error");
+        setLastModelError(result.trace.find((step) => step.title.includes("API Error"))?.detail ?? "Real API failed, using mock fallback.");
+      } else {
+        setModelStatus(config.useMockFallback ? "mock" : "missing-key");
+      }
       const scopedKeys = new Set(concepts.map((concept) => concept.normalizedKey || normalizeConceptName(concept.name)));
       const officialCards = result.cards.filter((card) => scopedKeys.has(card.normalizedKey || normalizeConceptName(card.name)));
       const temporaryResultCards = result.cards.filter((card) => !scopedKeys.has(card.normalizedKey || normalizeConceptName(card.name)));
@@ -1194,7 +1355,7 @@ export default function App() {
               {
                 id: `agent_space_hint_${Date.now()}`,
                 role: "agent",
-                text: `这个问题似乎不属于当前的${activeLearningSpace?.name ?? "学习空间"}方向。你可以切换到更匹配的学习空间，或继续提出与当前方向相关的专题问题。`
+                text: `这个问题似乎不属于当前的${activeLearningSpace?.name ?? "学习空间"}方向。你可以切换到更匹配的学习空间，或继续提出与当前方向相关的问题。`
               }
             ]
           }));
@@ -1255,7 +1416,7 @@ export default function App() {
         ...current,
         [sessionId]: [
           ...(current[sessionId] ?? []),
-          { id: `agent_error_${Date.now()}`, role: "agent", error: error instanceof Error ? error.message : "模型调用失败" }
+          { id: `agent_error_${Date.now()}`, role: "agent", error: error instanceof Error ? error.message : "妯″瀷璋冪敤澶辫触" }
         ]
       }));
       const userIsViewingSession = activePageRef.current === "learningSpace" && activeSessionIdRef.current === sessionId;
@@ -1321,7 +1482,7 @@ export default function App() {
     const finalCategory =
       category && category !== "待确认新概念" && category !== "待分类"
         ? category
-        : pending?.suggestedCategory && pending.suggestedCategory !== "待确认新概念"
+        : pending?.suggestedCategory && pending.suggestedCategory !== "寰呯‘璁ゆ柊姒傚康"
           ? pending.suggestedCategory
           : classifyConceptFallback(canonical.canonicalName, canonical.aliases);
     const fullCard = await ensureKnowledgeCard(canonical.canonicalName, {
@@ -1383,6 +1544,9 @@ export default function App() {
     let next = mastery;
     const changes: QuizResultChange[] = [];
     const newScored = new Set(scoredQuestionRef.current);
+    let wrongCount = 0;
+    let newMistakeCount = 0;
+    let newReviewTaskCount = 0;
     quizQuestions.forEach((question) => {
       const scoreKey = `${quizAttemptId}:${question.id}`;
       if (newScored.has(scoreKey)) return;
@@ -1391,21 +1555,30 @@ export default function App() {
       const result = applyQuizResult(next, question.conceptNames, question.difficulty, correct);
       next = result.mastery;
       changes.push(...result.changes);
+      if (!correct) {
+        wrongCount += 1;
+        if (addMistake(question, quizSource === "review_task" ? "review" : "diagnosis", true)) newMistakeCount += 1;
+        question.conceptNames.forEach((conceptName) => {
+          if (createReviewTask(conceptName, "quiz", { toast: false, navigate: false, reason: "检测答错后自动安排复习" })) newReviewTaskCount += 1;
+        });
+      }
     });
     scoredQuestionRef.current = newScored;
     writeLocal("scoredQuestionKeys", Array.from(newScored));
     setMastery(next);
     setQuizChanges(changes);
     setQuizSubmitted(true);
+    const correctCount = quizQuestions.filter((question) => checkQuizAnswer(question, selectedAnswers[question.id])).length;
+    const accuracy = quizQuestions.length > 0 ? correctCount / quizQuestions.length : 0;
     if (quizSource === "review_task" && activeReviewTaskId) {
-      const correctCount = quizQuestions.filter((question) => checkQuizAnswer(question, selectedAnswers[question.id])).length;
-      const passed = quizQuestions.length > 0 && correctCount / quizQuestions.length >= 0.6;
+      const passed = quizQuestions.length > 0 && accuracy >= 0.7;
       setReviewTasks((current) =>
         current.map((task) =>
           task.id === activeReviewTaskId
             ? {
                 ...task,
                 status: passed ? "done" : "pending",
+                reason: passed ? "检测通过，复习任务已完成" : "检测未通过，建议再次复习",
                 completedAt: passed ? now() : task.completedAt,
                 lastCheckPassed: passed,
                 lastCheckAt: now()
@@ -1413,8 +1586,18 @@ export default function App() {
             : task
         )
       );
-      showToast(passed ? "复习检测通过，任务已完成" : "本次检测未通过，建议稍后再复习");
+      showToast(passed ? "检测完成，掌握度已更新" : "本次检测未通过，已安排复习");
+    } else {
+      showToast("检测完成，掌握度已更新");
     }
+    setQuizSummary(`正确率 ${Math.round(accuracy * 100)}% · mastery 更新 ${changes.length} 项 · 新增错题 ${newMistakeCount} 道 · 新增复习 ${newReviewTaskCount} 项`);
+    appendTraceSteps([
+      { title: "Evaluator", type: "quiz", status: "success", detail: `Checked ${quizQuestions.length} questions, wrong ${wrongCount}` },
+      { title: "Mastery Updater", type: "mastery", status: "success", detail: `Applied ${changes.length} mastery changes` },
+      { title: "Mistake Collector", type: "mistake", status: "success", detail: `Added ${newMistakeCount} new mistake(s)` },
+      { title: "Review Scheduler", type: "review", status: "success", detail: `Added ${newReviewTaskCount} review task(s)` },
+      { title: "Reflector", type: "reflection", status: "success", detail: accuracy >= 0.7 ? "Quiz passed; continue to next weak concept" : "Quiz not passed; review task remains pending" }
+    ]);
   };
 
   const restartQuiz = (questions = builtInQuizBank.slice(0, 3), answers: Record<string, QuizAnswer> = {}) => {
@@ -1426,6 +1609,8 @@ export default function App() {
     setQuizChanges([]);
     setQuizWarning("");
     setQuizDifficultyHint("");
+    setQuizSummary("");
+    setQuizGenerationProgress(null);
   };
 
   const handleMistakePracticeSubmit = (mistake: MistakeItem, answer: QuizAnswer) => {
@@ -1479,7 +1664,9 @@ export default function App() {
     const requestedConceptNames = Array.isArray(overrideConceptNames) ? overrideConceptNames : selectedConceptNames;
     const requestedDifficulty = overrideDifficulty ?? quizDifficulty;
     const resolvedDifficulty = resolveQuizDifficulty(requestedDifficulty, requestedConceptNames);
+    const targetConceptLabel = requestedConceptNames[0] ?? "当前知识范围";
     setQuizGenerating(true);
+    setQuizGenerationProgress({ conceptName: targetConceptLabel, activeIndex: 0 });
     setQuizCollapsed(false);
     const requestedConceptSet = new Set(requestedConceptNames.map(normalizeConceptName));
     const scopedConcepts =
@@ -1487,6 +1674,11 @@ export default function App() {
         ? concepts.filter((concept) => requestedConceptSet.has(normalizeConceptName(concept.name)))
         : concepts.filter((concept) => quizCategory === "全部" || concept.category === quizCategory);
     try {
+      appendTraceSteps([
+        { title: "Context Reader", type: "context", status: "success", detail: `Prepared context for ${targetConceptLabel}` },
+        { title: "Quiz Generator", type: "quiz", status: "running", detail: config.apiKey.trim() ? "Calling LLM quiz generator" : "No API key; using mock/demo questions" }
+      ]);
+      setQuizGenerationProgress({ conceptName: targetConceptLabel, activeIndex: 1, sourceLabel: config.apiKey.trim() ? "LLM" : "Mock/Demo" });
       const generated = await generateQuiz(
         config,
         scopedConcepts.length > 0 ? scopedConcepts : concepts,
@@ -1497,9 +1689,18 @@ export default function App() {
         requestedConceptNames,
         selectedQuestionTypes
       );
+      setQuizGenerationProgress({ conceptName: targetConceptLabel, activeIndex: 2, sourceLabel: generated.questions[0]?.source ?? "unknown" });
       restartQuiz(generated.questions);
+      setQuizGenerationProgress({ conceptName: targetConceptLabel, activeIndex: 3, sourceLabel: generated.questions[0]?.source ?? "unknown" });
       setQuizWarning(generated.warning ?? "");
       setQuizDifficultyHint(resolvedDifficulty.reason);
+      appendTraceSteps([
+        { title: "Quiz Parser", type: "quiz", status: "success", detail: `Loaded ${generated.questions.length} question(s)` },
+        { title: "LLM / Mock Source", type: "quiz", status: "success", detail: generated.warning ? `Fallback/warning: ${generated.warning}` : `Question source: ${generated.questions[0]?.source ?? "unknown"}` },
+        { title: "Task Router", type: "router", status: "success", detail: "QuizPanel updated" }
+      ]);
+      window.setTimeout(() => setQuizGenerationProgress({ conceptName: targetConceptLabel, activeIndex: 4, sourceLabel: generated.questions[0]?.source ?? "unknown" }), 80);
+      window.setTimeout(() => setQuizGenerationProgress(null), 900);
     } finally {
       setQuizGenerating(false);
     }
@@ -1508,7 +1709,7 @@ export default function App() {
   const startKnowledgeCheck = async (conceptName: string, source: "knowledge_check" | "review_task" = "knowledge_check") => {
     const score = mastery.find((record) => normalizeConceptName(record.conceptName) === normalizeConceptName(conceptName))?.score;
     const difficulty = difficultyFromMastery(score);
-    openDiagnosisPanelForCurrentPage();
+    setActiveWorkspaceTab("quiz");
     setActiveCard(null);
     setSecondaryCard(null);
     setQuizSource(source);
@@ -1594,6 +1795,8 @@ export default function App() {
           changes={quizChanges}
           warning={quizWarning}
           difficultyHint={quizDifficultyHint}
+          summary={quizSummary}
+          generationProgress={quizGenerationProgress}
           collapsed={false}
           onAnswer={(questionId, answer) => {
             if (!quizSubmitted && !quizSubmitLockedRef.current) setSelectedAnswers((current) => ({ ...current, [questionId]: answer }));
@@ -1615,13 +1818,208 @@ export default function App() {
           onQuestionTypes={setSelectedQuestionTypes}
           onOpenCard={(conceptId, question) => openPrimaryCard(conceptId, question)}
           onToggleCollapsed={() => undefined}
+          onOpenReview={() => handleWorkspaceTabChange("review")}
+          onOpenTrace={() => handleWorkspaceTabChange("trace")}
         />
       );
     }
     if (spaceRightPanelMode === "modelConfig") {
-      return <ModelSettings config={config} connected={connected} onChange={(next) => { setConfig(next); setConnected(Boolean(next.apiKey.trim())); }} />;
+      return <ModelSettings config={config} connected={connected} status={modelStatus} lastError={lastModelError} onChange={handleConfigChange} onStatusChange={handleModelStatusChange} />;
     }
     return null;
+  };
+
+  const renderWorkbenchQuiz = () => (
+    <QuizPanel
+      concepts={concepts}
+      questions={quizQuestions}
+      selectedAnswers={selectedAnswers}
+      submitted={quizSubmitted}
+      difficulty={quizDifficulty}
+      category={quizCategory}
+      selectedConceptNames={selectedConceptNames}
+      selectedQuestionTypes={selectedQuestionTypes}
+      conceptSelectorOpen={conceptSelectorOpen}
+      highlight={quizHighlight}
+      generating={quizGenerating}
+      changes={quizChanges}
+      warning={quizWarning}
+      difficultyHint={quizDifficultyHint}
+      summary={quizSummary}
+      generationProgress={quizGenerationProgress}
+      collapsed={quizCollapsed}
+      onAnswer={(questionId, answer) => {
+        if (!quizSubmitted && !quizSubmitLockedRef.current) setSelectedAnswers((current) => ({ ...current, [questionId]: answer }));
+      }}
+      onSubmit={handleQuizSubmit}
+      mistakeIds={mistakes.flatMap((item) => [item.id, item.questionId])}
+      isQuestionInMistakeBook={isQuestionInMistakeBook}
+      onAddMistake={(question) => addMistake(question, quizSource === "review_task" ? "review" : "diagnosis")}
+      onCollectMistakes={collectWrongMistakes}
+      onGenerate={() => {
+        setQuizSource("diagnosis");
+        setActiveReviewTaskId(null);
+        handleGenerateQuiz();
+      }}
+      onDifficulty={handleDifficulty}
+      onCategory={handleCategory}
+      onConceptSelectorOpen={setConceptSelectorOpen}
+      onSelectedConcepts={setSelectedConceptNames}
+      onQuestionTypes={setSelectedQuestionTypes}
+      onOpenCard={(conceptId, question) => openPrimaryCard(conceptId, question)}
+      onToggleCollapsed={() => setQuizCollapsed((value) => !value)}
+      onOpenReview={() => handleWorkspaceTabChange("review")}
+      onOpenTrace={() => handleWorkspaceTabChange("trace")}
+    />
+  );
+
+  const renderWorkbenchContent = () => {
+    if (activeWorkspaceTab === "dashboard") {
+      return <DashboardPage document={parsedDocument} mastery={mastery} reviewTasks={reviewTasks} onNavigate={handleWorkspaceTabChange} />;
+    }
+
+    if (activeWorkspaceTab === "materials") {
+      return (
+        <MaterialsPage
+          document={parsedDocument}
+          concepts={concepts}
+          pendingCandidates={pendingCandidates}
+          cards={cards}
+          temporaryCards={temporaryCards}
+          mastery={mastery}
+          lastRetrievalResults={lastRetrievalResults}
+          onParsed={handleParsed}
+          onNavigate={handleWorkspaceTabChange}
+          onOpenCard={(conceptName) => openPrimaryCard(conceptName)}
+          onStartKnowledgeCheck={startKnowledgeCheck}
+          onAddReview={addReviewTask}
+          onConfirmCandidate={confirmCandidateFromMaterials}
+          onRejectCandidate={rejectCandidateConcept}
+          onRemoveConcept={removeConceptFromMaterials}
+          onRemoveCard={removeKnowledgeCardFromMaterials}
+          onRestoreDemoDocument={restoreDemoDocument}
+        />
+      );
+    }
+
+    if (activeWorkspaceTab === "assistant") {
+      return (
+        <div className="workspace-tab-stack assistant-page">
+          <section className="panel tab-page-header">
+            <div>
+              <p className="eyebrow">问 AI Agent</p>
+              <h2>聊天问答与学习追问</h2>
+              <span>复用原 ChatWindow 与 handleSend，回答会继续影响 Trace、候选知识点、反馈与复习入口。</span>
+            </div>
+          </section>
+          <div className="feature-card-grid compact">
+            <FeatureCard title="资料问答" description="围绕当前课程资料提问，支持查看来源、打开知识卡片和加入复习。" status="available" />
+            <FeatureCard title="追问薄弱点" description="可让 Agent 解释薄弱知识点，并通过反馈更新掌握度画像。" status="available" />
+            <FeatureCard title="课程 DDL 咨询" description="暂未接入真实 DDL 数据，可作为后续 Planner/Scheduler 的自然语言入口。" status="planned" />
+          </div>
+          <ChatWindow
+            messages={messages}
+            input={input}
+            loading={loading}
+            config={config}
+            modelStatus={modelStatus}
+            lastModelError={lastModelError}
+            documentTitle={parsedDocument.fileName}
+            chunkCount={parsedDocument.chunks.length}
+            lastContextCount={lastRetrievalResults.length}
+            usedFallbackContext={lastRetrievalResults.some((result) => result.fallback)}
+            onInputChange={setInput}
+            onSend={handleSend}
+            onOpenCard={(conceptId) => openPrimaryCard(conceptId)}
+            feedbackByMessageConcept={feedbackByMessageConcept}
+            onFeedback={handleFeedback}
+            onAddReview={addReviewTask}
+            isInReview={isInReview}
+          />
+        </div>
+      );
+    }
+
+    if (activeWorkspaceTab === "plan") {
+      return (
+        <div className="workspace-tab-stack">
+          <section className="panel study-plan-placeholder">
+            <div className="panel-header">
+              <div>
+                <p className="eyebrow">学习计划</p>
+                <h2>DDL 驱动计划将在下一轮接入</h2>
+                <span>第一轮先把计划入口独立出来，暂时复用今日复习任务作为可展示的任务进度。</span>
+              </div>
+              <CalendarCheck size={22} />
+            </div>
+            <div className="plan-placeholder-body">
+              <div><strong>{reviewTasks.filter((task) => task.status === "pending").length}</strong><span>待完成复习任务</span></div>
+              <div><strong>{reviewTasks.filter((task) => task.status === "done").length}</strong><span>已完成任务</span></div>
+              <div><strong>{mastery.filter((item) => item.score < 0.4).length}</strong><span>薄弱知识点</span></div>
+            </div>
+          </section>
+          <div className="feature-card-grid compact">
+            <FeatureCard title="DDL 驱动排期" description="根据课程截止日期倒推每日任务，当前还未实现真实 DDL 输入。" status="planned" />
+            <FeatureCard title="复习任务追踪" description="复用 ReviewTaskPanel 展示待复习知识点，并可启动复习检测。" status="available" />
+            <FeatureCard title="动态重排计划" description="后续可根据完成情况和测验结果重新分配任务优先级。" status="wip" />
+          </div>
+          <ReviewTaskPanel reviewTasks={reviewTasks} onOpenCard={(conceptId) => openPrimaryCard(conceptId)} onStartReviewCheck={startReviewTaskCheck} />
+        </div>
+      );
+    }
+
+    if (activeWorkspaceTab === "quiz") {
+      return (
+        <div className="workspace-tab-stack">
+          <div className="feature-card-grid compact">
+            <FeatureCard title="诊断测验" description="支持按难度、题型和知识点生成或使用内置题库。" status="available" />
+            <FeatureCard title="掌握度画像更新" description="提交测验后通过 masteryService 更新知识点掌握度。" status="available" />
+            <FeatureCard title="个性化计划联动" description="测验结果已经能进入错题和复习，后续再接入 DDL 计划生成。" status="wip" />
+          </div>
+          {renderWorkbenchQuiz()}
+        </div>
+      );
+    }
+
+    if (activeWorkspaceTab === "trace") {
+      return (
+        <div className="workspace-tab-stack">
+          <div className="feature-card-grid compact">
+            <FeatureCard title="Planner" description="当前 Trace 展示规划步骤，但还不是独立可配置的 Planner 模块。" status="mock" />
+            <FeatureCard title="Retriever" description="从资料片段和知识点中组织回答上下文，尚未接入向量库。" status="wip" />
+            <FeatureCard title="Evaluator / Reflector" description="通过测验、反馈、复习记录沉淀状态，后续可用于动态调整计划。" status="wip" />
+          </div>
+          <AgentTracePanel trace={trace} />
+        </div>
+      );
+    }
+
+    if (activeWorkspaceTab === "settings") {
+      return (
+        <div className="workspace-tab-stack settings-page">
+          <ModelSettings config={config} connected={connected} status={modelStatus} lastError={lastModelError} onChange={handleConfigChange} onStatusChange={handleModelStatusChange} />
+          <div className="feature-card-grid compact">
+            <FeatureCard title="模型配置" description="配置 OpenAI-compatible baseUrl、model、apiKey 和 mock fallback。" status="available" />
+            <FeatureCard title="学习空间" description="保留原专题会话页面，适合作为多课程和科研方向入口。" status="wip" actionLabel="进入学习空间" onAction={() => navigatePage("learningSpace")} />
+            <FeatureCard title="完整错题页" description="保留旧的完整 MistakesPage，用于更细的错题筛选和练习。" status="available" actionLabel="进入完整错题页" onAction={() => navigatePage("mistakes")} />
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="workspace-tab-stack">
+        <div className="feature-card-grid compact">
+          <FeatureCard title="今日复习任务" description="查看待复习知识点，并可启动复习检测。" status="available" />
+          <FeatureCard title="错题本摘要" description="保留 MistakeBookPanel，可查看错题、练习和标记解决。" status="available" />
+          <FeatureCard title="完整错题工作台" description="旧 MistakesPage 未迁移，仍可从这里进入。" status="available" actionLabel="打开完整错题页" onAction={() => navigatePage("mistakes")} />
+        </div>
+        <div className="workspace-tab-grid two">
+          <ReviewTaskPanel reviewTasks={reviewTasks} onOpenCard={(conceptId) => openPrimaryCard(conceptId)} onStartReviewCheck={startReviewTaskCheck} />
+          <MistakeBookPanel mistakes={mistakes} onOpenCard={(conceptId) => openPrimaryCard(conceptId)} onPracticeSubmit={handleMistakePracticeSubmit} onResolveMistake={resolveMistake} />
+        </div>
+      </div>
+    );
   };
 
   return (
@@ -1632,6 +2030,7 @@ export default function App() {
           <AppSwitchMenu activePage={activePage} rect={appMenuRect} onNavigate={navigatePage} onKeepOpen={() => openAppMenu(appMenuRect)} onClose={closeAppMenu} />
         </div>
       )}
+      {activePage !== "workbench" && (
       <header className={`app-header ${activePage === "mistakes" ? "mistakes-header" : ""}`}>
         <div className="header-left">
           <div className="brand">
@@ -1660,10 +2059,10 @@ export default function App() {
           {activePage !== "mistakes" && (
           <button
             className="page-switch-button"
-            onClick={() => navigatePage(activePage === "workbench" ? "learningSpace" : "workbench")}
+            onClick={() => navigatePage("workbench")}
           >
-            {activePage === "workbench" ? "进入学习空间" : "进入学习工作区"}
-            {(activePage === "workbench" ? spacesHasUnread || crossPageNotice.spacesUnread : crossPageNotice.workbenchUnread) && <span className="nav-notice-dot" />}
+            学习工作台
+            {crossPageNotice.workbenchUnread && <span className="nav-notice-dot" />}
           </button>
           )}
         </div>
@@ -1671,7 +2070,7 @@ export default function App() {
           <span>{parsedDocument.status === "ready" ? "资料已解析" : "资料部分可用"}</span>
           <span>知识点 {concepts.length} 个</span>
           <span className={connected ? "connection-label ok" : "connection-label"}>{connected ? "模型已配置" : "mock 可用"}</span>
-                <div className={`nav-action-button nav-action-split mistake-nav-split-button ${(activePage === "mistakes" || (activePage === "workbench" ? rightPanelMode === "mistakes" : spaceRightPanelMode === "mistakes")) ? "active" : ""}`}>
+                <div className={`nav-action-button nav-action-split mistake-nav-split-button ${(activePage === "mistakes" || spaceRightPanelMode === "mistakes") ? "active" : ""}`}>
             <button
               className={`mistake-nav-enter ${activePage === "mistakes" ? "exit-mode" : ""}`}
               title={activePage === "mistakes" ? "返回上一学习页面" : "进入错题本页面"}
@@ -1683,13 +2082,13 @@ export default function App() {
               className="mistake-nav-toggle"
               onClick={() => {
                 if (activePage === "mistakes") return;
-                activePage === "workbench" ? toggleRightPanel("mistakes") : toggleSpaceRightPanel("mistakes");
+                toggleSpaceRightPanel("mistakes");
               }}
             >
               错题本
             </button>
           </div>
-          <button className={`secondary-button small nav-action-button ${(activePage === "workbench" ? rightPanelMode === "review" : activePage === "mistakes" ? mistakesRightPanelMode === "review" : spaceRightPanelMode === "review") ? "active" : ""}`} onClick={() => (activePage === "workbench" ? toggleRightPanel("review") : activePage === "mistakes" ? toggleMistakesRightPanel("review") : toggleSpaceRightPanel("review"))}>
+          <button className={`secondary-button small nav-action-button ${(activePage === "mistakes" ? mistakesRightPanelMode === "review" : spaceRightPanelMode === "review") ? "active" : ""}`} onClick={() => (activePage === "mistakes" ? toggleMistakesRightPanel("review") : toggleSpaceRightPanel("review"))}>
             <CalendarCheck size={14} />
             复习任务
           </button>
@@ -1703,9 +2102,9 @@ export default function App() {
             {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
             {theme === "dark" ? "浅色模式" : "深色模式"}
           </button>
-          <button className={`secondary-button small nav-action-button ${(activePage === "workbench" ? rightPanelMode === "modelConfig" : activePage === "mistakes" ? mistakesRightPanelMode === "modelConfig" : spaceRightPanelMode === "modelConfig") ? "active" : ""}`} onClick={() => (activePage === "workbench" ? toggleRightPanel("modelConfig") : activePage === "mistakes" ? toggleMistakesRightPanel("modelConfig") : toggleSpaceRightPanel("modelConfig"))}>
+          <button className={`secondary-button small nav-action-button ${(activePage === "mistakes" ? mistakesRightPanelMode === "modelConfig" : spaceRightPanelMode === "modelConfig") ? "active" : ""}`} onClick={() => (activePage === "mistakes" ? toggleMistakesRightPanel("modelConfig") : toggleSpaceRightPanel("modelConfig"))}>
             <Settings size={14} />
-            模型配置
+            模型设置
           </button>
           <button className="secondary-button small" onClick={() => restartQuiz(builtInQuizBank.slice(0, 3), demoAnswers)}>
             <RotateCcw size={14} />
@@ -1713,208 +2112,32 @@ export default function App() {
           </button>
         </div>
       </header>
+      )}
 
       {activePage === "workbench" ? (
-      <main className="dashboard">
-        <div className="left-column">
-          <DocumentPanel document={parsedDocument} onParsed={handleParsed} onOpenCard={(conceptId) => openPrimaryCard(conceptId)} />
-          <QuizPanel
-            concepts={concepts}
-            questions={quizQuestions}
-            selectedAnswers={selectedAnswers}
-            submitted={quizSubmitted}
-            difficulty={quizDifficulty}
-            category={quizCategory}
-            selectedConceptNames={selectedConceptNames}
-            selectedQuestionTypes={selectedQuestionTypes}
-            conceptSelectorOpen={conceptSelectorOpen}
-            highlight={quizHighlight}
-            generating={quizGenerating}
-            changes={quizChanges}
-            warning={quizWarning}
-            difficultyHint={quizDifficultyHint}
-            collapsed={quizCollapsed}
-            onAnswer={(questionId, answer) => {
-              if (!quizSubmitted && !quizSubmitLockedRef.current) setSelectedAnswers((current) => ({ ...current, [questionId]: answer }));
-            }}
-            onSubmit={handleQuizSubmit}
-            mistakeIds={mistakes.flatMap((item) => [item.id, item.questionId])}
-            isQuestionInMistakeBook={isQuestionInMistakeBook}
-            onAddMistake={(question) => addMistake(question, quizSource === "review_task" ? "review" : "diagnosis")}
-            onCollectMistakes={collectWrongMistakes}
-            onGenerate={() => {
-              setQuizSource("diagnosis");
-              setActiveReviewTaskId(null);
-              handleGenerateQuiz();
-            }}
-            onDifficulty={handleDifficulty}
-            onCategory={handleCategory}
-            onConceptSelectorOpen={setConceptSelectorOpen}
-            onSelectedConcepts={setSelectedConceptNames}
-            onQuestionTypes={setSelectedQuestionTypes}
-            onOpenCard={(conceptId, question) => openPrimaryCard(conceptId, question)}
-            onToggleCollapsed={() => setQuizCollapsed((value) => !value)}
-          />
-        </div>
-
-        <div className="center-column">
-          <ChatWindow
-            messages={messages}
-            input={input}
-            loading={loading}
-            config={config}
-            onInputChange={setInput}
-            onSend={handleSend}
-            onOpenCard={(conceptId) => openPrimaryCard(conceptId)}
-            feedbackByMessageConcept={feedbackByMessageConcept}
-            onFeedback={handleFeedback}
-            onAddReview={addReviewTask}
-            isInReview={isInReview}
-          />
-
-          <section className="panel cards-panel">
-            <div className="panel-header compact collapsible-header">
-              <div>
-                <p className="eyebrow">知识卡片库</p>
-                <h2>按分类查看卡片</h2>
-                {cardsCollapsed && <span className="collapse-summary">知识卡片库：{cards.length} 张卡片，{categories.length} 个分类</span>}
-              </div>
-              <button className="icon-button" onClick={() => setCardsCollapsed((value) => !value)} aria-label="切换知识卡片库">
-                <Plus size={18} />
-              </button>
-            </div>
-            {!cardsCollapsed && (
-              <>
-                <div className="category-tabs">
-                  {["全部", ...categories].map((category) => (
-                    <button className={activeCategory === category ? "active" : ""} key={category} onClick={() => setActiveCategory(category)}>
-                      {category}
-                    </button>
-                  ))}
-                </div>
-                <div className="card-list">
-                  {visibleCards.map((card) => (
-                    <button className="mini-card" key={card.id} onClick={() => openPrimaryCard(card.name)}>
-                      <strong>{card.name}</strong>
-                      <span>{card.category}</span>
-                      <p>{card.summary}</p>
-                    </button>
-                  ))}
-                </div>
-              </>
-            )}
-          </section>
-
-          {candidateConcepts.length > 0 && (
-            <section className="panel candidate-panel">
-              <div className="panel-header compact">
-                <div>
-                  <p className="eyebrow">候选知识点</p>
-                  <h2>可加入当前课程</h2>
-                </div>
-              </div>
-              <div className="candidate-list">
-                {candidateConcepts.map((candidate) => (
-                  <article key={candidate.id}>
-                    <strong>{candidate.canonicalName}</strong>
-                    {candidate.aliases.length > 0 && <span>别名：{candidate.aliases.join("、")}</span>}
-                    <span>{candidate.suggestedCategory || "待确认分类"} · 来自{candidate.source === "chat" ? "问答" : candidate.source === "quiz_explanation" ? "习题解析" : "新概念识别"}</span>
-                    <p>{candidate.summary || candidate.reason || "系统识别到的待确认新知识点，请确认后再加入正式知识库。"}</p>
-                    <button
-                      className="secondary-button small"
-                      onClick={() =>
-                        openCardWithGeneratedFallback(candidate.canonicalName, {
-                          category: candidate.suggestedCategory,
-                          source: "chat",
-                          sourceText: candidate.reason
-                        })
-                      }
-                    >
-                      查看卡片
-                    </button>
-                    <button
-                      className="secondary-button small"
-                      onClick={() => {
-                        setCandidateMasteryPicker(candidate.normalizedKey);
-                        setCandidateInitialScores((current) => ({ ...current, [candidate.normalizedKey]: current[candidate.normalizedKey] ?? 0.15 }));
-                      }}
-                    >
-                      是，加入知识库
-                    </button>
-                    <button className="secondary-button small" onClick={() => dismissCandidate(candidate)}>
-                      否，清除
-                    </button>
-                    {candidateMasteryPicker === candidate.normalizedKey && (
-                      <div className="candidate-confirm-panel">
-                        <div className="candidate-confirm-title">你目前对这个知识点的掌握情况是？</div>
-                        <div className="mastery-choice-grid">
-                          {[
-                            { score: 0.15, label: "没听过 / 基本不了解" },
-                            { score: 0.35, label: "听过但不太会用" },
-                            { score: 0.55, label: "基本理解，想加入复习" }
-                          ].map((option) => (
-                            <button
-                              key={option.score}
-                              className={candidateInitialScores[candidate.normalizedKey] === option.score ? "active" : ""}
-                              onClick={() => setCandidateInitialScores((current) => ({ ...current, [candidate.normalizedKey]: option.score }))}
-                            >
-                              <span>{option.label}</span>
-                              <small>{option.score.toFixed(2)}</small>
-                            </button>
-                          ))}
-                        </div>
-                        <div className="candidate-confirm-actions">
-                          <button className="secondary-button small" onClick={() => setCandidateMasteryPicker(null)}>
-                            取消
-                          </button>
-                          <button
-                            className="primary-button small"
-                            onClick={() =>
-                              addCandidateToCourseKnowledge(
-                                candidate.canonicalName,
-                                candidate.suggestedCategory || "待分类",
-                                candidate.reason || "",
-                                candidateInitialScores[candidate.normalizedKey] ?? 0.15,
-                                undefined,
-                                candidate.source
-                              )
-                            }
-                          >
-                            确认加入
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </article>
-                ))}
-              </div>
-            </section>
-          )}
-
-          <MasteryPanel
-            mastery={mastery}
-            concepts={concepts}
-            collapsed={masteryCollapsed}
-            onOpenCard={(conceptId) => openPrimaryCard(conceptId)}
-            onToggleCollapsed={() => setMasteryCollapsed((value) => !value)}
-          />
-        </div>
-
-        {rightPanelMode === "mistakes" ? (
-          <MistakeBookPanel
-            mistakes={mistakes}
-            onOpenCard={(conceptId) => openPrimaryCard(conceptId)}
-            onPracticeSubmit={handleMistakePracticeSubmit}
-            onResolveMistake={resolveMistake}
-          />
-        ) : rightPanelMode === "review" ? (
-          <ReviewTaskPanel reviewTasks={reviewTasks} onOpenCard={(conceptId) => openPrimaryCard(conceptId)} onStartReviewCheck={startReviewTaskCheck} />
-        ) : rightPanelMode === "modelConfig" ? (
-          <ModelSettings config={config} connected={connected} onChange={(next) => { setConfig(next); setConnected(Boolean(next.apiKey.trim())); }} />
-        ) : (
-          <AgentTracePanel trace={trace} />
-        )}
-      </main>
+        <AppShell
+          header={
+            <Header
+              courseSummary={`${parsedDocument.fileName} · ${concepts.length} 个知识点`}
+              goalSummary="目标：一周内完成反向传播与链式法则复习"
+              connected={connected}
+              onModelSettings={() => handleWorkspaceTabChange("settings")}
+            />
+          }
+          sidebar={<Sidebar activeTab={activeWorkspaceTab} onTabChange={handleWorkspaceTabChange} />}
+          rightPanel={
+            <RightSummaryPanel
+              mastery={mastery}
+              reviewTasks={reviewTasks}
+              trace={trace}
+              connected={connected}
+              onOpenReview={() => handleWorkspaceTabChange("review")}
+              onOpenTrace={() => handleWorkspaceTabChange("trace")}
+            />
+          }
+        >
+          {renderWorkbenchContent()}
+        </AppShell>
       ) : activePage === "mistakes" ? (
       <MistakesPage
         mistakes={mistakes}
@@ -1930,7 +2153,7 @@ export default function App() {
         onStartReviewCheck={startReviewTaskCheck}
         config={config}
         connected={connected}
-        onConfigChange={(next) => { setConfig(next); setConnected(Boolean(next.apiKey.trim())); }}
+        onConfigChange={handleConfigChange}
         concepts={concepts}
         questions={quizQuestions}
         selectedAnswers={selectedAnswers}
@@ -2051,6 +2274,12 @@ export default function App() {
             input={expertInput}
             loading={Boolean(activeSession?.isGenerating)}
             config={config}
+            modelStatus={modelStatus}
+            lastModelError={lastModelError}
+            documentTitle={parsedDocument.fileName}
+            chunkCount={parsedDocument.chunks.length}
+            lastContextCount={lastRetrievalResults.length}
+            usedFallbackContext={lastRetrievalResults.some((result) => result.fallback)}
             onInputChange={(value) => activeSession && setSessionInputs((current) => ({ ...current, [activeSession.id]: value }))}
             onSend={handleExpertSend}
             onOpenCard={(conceptId) => openPrimaryCard(conceptId)}
@@ -2094,7 +2323,7 @@ export default function App() {
                           {[
                             { score: 0.15, label: "没听过 / 基本不了解" },
                             { score: 0.35, label: "听过但不太会用" },
-                            { score: 0.55, label: "基本理解，想加入复习" }
+                            { score: 0.55, label: "鍩烘湰鐞嗚В锛屾兂鍔犲叆澶嶄範" }
                           ].map((option) => (
                             <button
                               key={option.score}

@@ -1,6 +1,6 @@
 import { Bot, Loader2, Send, UserRound } from "lucide-react";
 import { useEffect, useRef } from "react";
-import type { ChatMessage, ConceptId, LLMConfig, SourceRef } from "../types";
+import type { ChatMessage, ConceptId, LLMConfig, ModelConnectionStatus, SourceRef } from "../types";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 
 type Props = {
@@ -8,6 +8,12 @@ type Props = {
   input: string;
   loading: boolean;
   config: LLMConfig;
+  modelStatus: ModelConnectionStatus;
+  lastModelError?: string;
+  documentTitle?: string;
+  chunkCount?: number;
+  lastContextCount?: number;
+  usedFallbackContext?: boolean;
   onInputChange: (value: string) => void;
   onSend: () => void;
   onOpenCard: (conceptId: ConceptId) => void;
@@ -45,6 +51,12 @@ export function ChatWindow({
   input,
   loading,
   config,
+  modelStatus,
+  lastModelError,
+  documentTitle,
+  chunkCount = 0,
+  lastContextCount = 0,
+  usedFallbackContext = false,
   onInputChange,
   onSend,
   onOpenCard,
@@ -68,7 +80,19 @@ export function ChatWindow({
           <p className="eyebrow">自适应问答 Agent</p>
           <h2>先查画像，再生成解释</h2>
         </div>
-        <span className={`mode-pill ${config.apiKey ? "llm" : "mock"}`}>{config.apiKey ? "真实 LLM 可用" : "mock fallback"}</span>
+        <span className={`mode-pill ${modelStatus === "ready" ? "llm" : "mock"}`}>
+          {modelStatus === "ready" ? `Real API: ${config.model}` : config.useMockFallback ? "Mock fallback" : "API not ready"}
+        </span>
+      </div>
+      {lastModelError && <div className="settings-message">Last API error: {lastModelError}</div>}
+      <div className="context-status-card">
+        <strong>{chunkCount > 0 ? "Material context enabled" : "Normal LLM chat"}</strong>
+        <span>
+          {chunkCount > 0
+            ? `${documentTitle ?? "Current material"} · ${chunkCount} chunks · last answer used ${lastContextCount} chunk(s)${usedFallbackContext ? " · weak fallback chunks" : ""}`
+            : "No uploaded material chunks are available for prompt injection."}
+        </span>
+        <small>Simplified retrieval: keyword matching + chunk injection, no embeddings or vector database.</small>
       </div>
 
       <div className="message-list">
