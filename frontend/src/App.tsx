@@ -849,9 +849,9 @@ export default function App() {
   };
 
   const difficultyLabel = (difficulty: QuizDifficulty) => {
-    if (difficulty === "basic") return "鍩虹";
-    if (difficulty === "medium") return "涓瓑";
-    return "鎻愰珮";
+    if (difficulty === "basic") return "基础";
+    if (difficulty === "medium") return "中等";
+    return "提高";
   };
 
   const resolveQuizDifficulty = (
@@ -1841,7 +1841,7 @@ export default function App() {
           onQuestionTypes={setSelectedQuestionTypes}
           onOpenCard={(conceptId, question) => openPrimaryCard(conceptId, question)}
           onToggleCollapsed={() => undefined}
-          onOpenReview={() => handleWorkspaceTabChange("review")}
+          onOpenReview={() => handleWorkspaceTabChange("mistakes")}
           onOpenTrace={() => handleWorkspaceTabChange("trace")}
         />
       );
@@ -1891,7 +1891,7 @@ export default function App() {
       onQuestionTypes={setSelectedQuestionTypes}
       onOpenCard={(conceptId, question) => openPrimaryCard(conceptId, question)}
       onToggleCollapsed={() => setQuizCollapsed((value) => !value)}
-      onOpenReview={() => handleWorkspaceTabChange("review")}
+      onOpenReview={() => handleWorkspaceTabChange("mistakes")}
       onOpenTrace={() => handleWorkspaceTabChange("trace")}
     />
   );
@@ -2000,6 +2000,55 @@ export default function App() {
             <FeatureCard title="个性化计划联动" description="测验结果已经能进入错题和复习，后续再接入 DDL 计划生成。" status="wip" />
           </div>
           {renderWorkbenchQuiz()}
+        </div>
+      );
+    }
+
+    if (activeWorkspaceTab === "mistakes") {
+      return (
+        <div className="workspace-tab-stack mistakes-workbench-page">
+          <section className="panel tab-page-header">
+            <div>
+              <p className="eyebrow">错题本</p>
+              <h2>Quiz 错题记录与订正回顾</h2>
+              <span>这里收集 Quiz 判题后的错题，用于订正、重新练习和加入今日复习。</span>
+            </div>
+          </section>
+          <div className="feature-card-grid compact">
+            <FeatureCard title="错题记录" description={`${mistakes.filter((item) => item.status !== "mastered").length} 道待订正错题`} status="available" />
+            <FeatureCard title="订正回顾" description="保留题干、我的答案、正确答案和解析，支持重新练习。" status="available" />
+            <FeatureCard title="复习联动" description="可从错题加入今日复习，继续进入知识检测闭环。" status="wip" />
+          </div>
+          <MistakeBookPanel
+            mistakes={mistakes}
+            onOpenCard={(conceptId) => openPrimaryCard(conceptId)}
+            onPracticeSubmit={handleMistakePracticeSubmit}
+            onResolveMistake={resolveMistake}
+            onAddReview={addReviewTask}
+          />
+        </div>
+      );
+    }
+
+    if (activeWorkspaceTab === "review") {
+      const pendingReviewCount = reviewTasks.filter((task) => task.status === "pending").length;
+      const doneReviewCount = reviewTasks.filter((task) => task.status === "done").length;
+      const weakConceptCount = mastery.filter((item) => item.score < 0.4).length;
+      return (
+        <div className="workspace-tab-stack today-review-page">
+          <section className="panel tab-page-header">
+            <div>
+              <p className="eyebrow">今日复习</p>
+              <h2>复习任务与知识检测</h2>
+              <span>当前复习任务基于本地状态生成，用于中期演示。</span>
+            </div>
+          </section>
+          <div className="materials-stat-grid">
+            <div className="summary-card"><strong>{pendingReviewCount}</strong><span>今日待复习</span></div>
+            <div className="summary-card"><strong>{doneReviewCount}</strong><span>已完成</span></div>
+            <div className="summary-card"><strong>{weakConceptCount}</strong><span>薄弱知识点</span></div>
+          </div>
+          <ReviewTaskPanel reviewTasks={reviewTasks} onOpenCard={(conceptId) => openPrimaryCard(conceptId)} onStartReviewCheck={startReviewTaskCheck} />
         </div>
       );
     }

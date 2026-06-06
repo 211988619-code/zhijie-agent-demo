@@ -143,7 +143,7 @@ export function QuizPanel({
           </div>
 
           <div className="quiz-actions"><button className="primary-button" disabled={submitted || answeredCount < questions.length} onClick={onSubmit}>{submitted ? "已提交 / 已计分" : "提交诊断"}</button><button className="secondary-button" disabled={!submitted} onClick={onCollectMistakes}>收集全部错题</button></div>
-          {submitted && <div className="diagnosis-done"><strong>画像更新：</strong>{summary && <p>{summary}</p>}{changes.map((change) => <span key={`${change.conceptName}-${change.oldScore}-${change.newScore}`}>{change.conceptName}: {change.oldScore.toFixed(2)} -&gt; {change.newScore.toFixed(2)}{change.note ? `；${change.note}` : ""}</span>)}<div className="quiz-followup-actions"><button className="secondary-button small" type="button" onClick={onOpenReview}>查看错题与复习</button><button className="secondary-button small" type="button" onClick={onOpenTrace}>查看执行过程</button></div></div>}
+          {submitted && <div className="diagnosis-done"><strong>画像更新：</strong>{summary && <p>{summary}</p>}{changes.map((change) => <span key={`${change.conceptName}-${change.oldScore}-${change.newScore}`}>{change.conceptName}: {change.oldScore.toFixed(2)} -&gt; {change.newScore.toFixed(2)}{change.note ? `；${change.note}` : ""}</span>)}<div className="quiz-followup-actions"><button className="secondary-button small" type="button" onClick={onOpenReview}>查看错题</button><button className="secondary-button small" type="button" onClick={onOpenTrace}>查看执行过程</button></div></div>}
         </>
       )}
     </section>

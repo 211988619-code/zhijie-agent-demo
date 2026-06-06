@@ -1,6 +1,6 @@
-﻿import { BookOpenCheck, Bot, ClipboardCheck, FileText, LayoutDashboard, ListChecks, MessageCircle, Settings } from "lucide-react";
+import { BookOpenCheck, Bot, CalendarCheck, ClipboardCheck, FileText, LayoutDashboard, ListChecks, MessageCircle, Settings } from "lucide-react";
 
-export type WorkspaceTab = "dashboard" | "materials" | "assistant" | "plan" | "quiz" | "trace" | "review" | "settings";
+export type WorkspaceTab = "dashboard" | "materials" | "assistant" | "plan" | "quiz" | "trace" | "mistakes" | "review" | "settings";
 
 type Props = {
   activeTab: WorkspaceTab;
@@ -13,8 +13,9 @@ const tabs: Array<{ id: WorkspaceTab; label: string; helper: string; icon: typeo
   { id: "assistant", label: "问 AI Agent", helper: "聊天问答与追问", icon: MessageCircle },
   { id: "plan", label: "学习计划", helper: "任务与进度", icon: ListChecks },
   { id: "quiz", label: "能力评估", helper: "诊断测验", icon: ClipboardCheck },
+  { id: "mistakes", label: "错题本", helper: "错题记录、订正回顾", icon: BookOpenCheck },
+  { id: "review", label: "今日复习", helper: "复习任务、知识检测", icon: CalendarCheck },
   { id: "trace", label: "Agent 执行过程", helper: "Trace Timeline", icon: Bot },
-  { id: "review", label: "错题与复习", helper: "错题本、今日任务", icon: BookOpenCheck },
   { id: "settings", label: "设置 / More", helper: "模型配置与实验区", icon: Settings }
 ];
 

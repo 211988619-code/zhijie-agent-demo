@@ -1,4 +1,4 @@
-import { BookOpenCheck, FilterX } from "lucide-react";
+import { BookOpenCheck, FilterX, RotateCcw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { checkQuizAnswer } from "../services/quizService";
 import type { ConceptId, MistakeItem, QuizAnswer } from "../types";
@@ -16,6 +16,7 @@ type Props = {
   onOpenCard: (conceptId: ConceptId) => void;
   onPracticeSubmit: (mistake: MistakeItem, answer: QuizAnswer) => boolean;
   onResolveMistake: (mistakeId: string, resolution: "understood" | "still_confused") => void;
+  onAddReview?: (conceptName: string, source: "knowledge_card" | "chat_suggestion" | "quiz") => void;
 };
 
 const ALL_FILTER = "全部";
@@ -26,7 +27,13 @@ function formatAnswer(answer?: string | string[]) {
   return Array.isArray(answer) ? answer.join("、") : answer;
 }
 
-export function MistakeBookPanel({ mistakes, onOpenCard, onPracticeSubmit, onResolveMistake }: Props) {
+function sourceLabel(source: MistakeItem["source"]) {
+  if (source === "review") return "复习检测";
+  if (source === "practice") return "错题练习";
+  return "诊断测验";
+}
+
+export function MistakeBookPanel({ mistakes, onOpenCard, onPracticeSubmit, onResolveMistake, onAddReview }: Props) {
   const [category, setCategory] = useState(ALL_FILTER);
   const [difficulty, setDifficulty] = useState(ALL_FILTER);
   const [conceptName, setConceptName] = useState(ALL_FILTER);
@@ -82,6 +89,7 @@ export function MistakeBookPanel({ mistakes, onOpenCard, onPracticeSubmit, onRes
         <div>
           <p className="eyebrow">错题本</p>
           <h2>诊断错题复盘</h2>
+          <span className="collapse-summary">这里收集 Quiz 判题后的错题，用于订正和二次复习。</span>
         </div>
         <BookOpenCheck size={22} />
       </div>
@@ -121,7 +129,7 @@ export function MistakeBookPanel({ mistakes, onOpenCard, onPracticeSubmit, onRes
       </div>
 
       {visibleMistakes.length === 0 ? (
-        <div className="trace-empty">当前没有符合条件的错题。完成诊断后，可以把答错题收入错题本。</div>
+        <div className="trace-empty">暂无错题。完成一次知识检测后，错误题目会出现在这里。</div>
       ) : (
         <div className="mistake-list">
           {visibleMistakes.map((mistake) => {
@@ -139,10 +147,20 @@ export function MistakeBookPanel({ mistakes, onOpenCard, onPracticeSubmit, onRes
                     </button>
                   ))}
                   <span className="source-chip">{mistake.difficulty}</span>
+                  <span className="source-chip">{sourceLabel(mistake.source)}</span>
                   <span className="source-chip">做错 {mistake.wrongCount} 次</span>
                 </div>
 
                 <MarkdownRenderer content={question.questionMarkdown} compact />
+
+                <div className="mistake-explanation">
+                  <div className="mistake-meta">
+                    <span>我的答案：{formatAnswer(mistake.lastUserAnswer)}</span>
+                    <span>正确答案：{formatAnswer(question.answer)}</span>
+                    <span>{new Date(mistake.updatedAt || mistake.createdAt).toLocaleString()}</span>
+                  </div>
+                  <MarkdownRenderer content={question.explanationMarkdown} compact />
+                </div>
 
                 <div className="quiz-options">
                   {question.options.map((option) => {
@@ -171,22 +189,17 @@ export function MistakeBookPanel({ mistakes, onOpenCard, onPracticeSubmit, onRes
                   })}
                 </div>
 
-                {practice.submitted && (
-                  <div className="mistake-explanation">
-                    <div className="mistake-meta">
-                      <span>正确答案：{formatAnswer(question.answer)}</span>
-                      <span>上次作答：{formatAnswer(mistake.lastUserAnswer)}</span>
-                      <span>本次作答：{formatAnswer(selected)}</span>
-                    </div>
-                    <MarkdownRenderer content={question.explanationMarkdown} compact />
-                  </div>
-                )}
-
                 {!practice.submitted ? (
                   <div className="mistake-actions">
                     <button className="secondary-button small" disabled={!practice.answer} onClick={() => submitPractice(mistake)}>
-                      再做一次
+                      <RotateCcw size={14} />
+                      重新练习
                     </button>
+                    {onAddReview && (
+                      <button className="secondary-button small" onClick={() => onAddReview(mistake.conceptNames[0] ?? "待分类", "quiz")}>
+                        加入今日复习
+                      </button>
+                    )}
                   </div>
                 ) : (
                   <div className={`quiz-result ${resultCorrect ? "correct-text" : "wrong-text"}`}>

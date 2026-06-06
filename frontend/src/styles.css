@@ -247,12 +247,15 @@ button {
 
 .app-main .trace-list,
 .app-main .review-panel-list,
+.app-main .mistake-list,
 .app-main .quiz-list,
 .app-main .settings-form,
 .workspace-tab-stack .trace-list,
 .workspace-tab-stack .review-panel-list,
+.workspace-tab-stack .mistake-list,
 .workspace-tab-grid .trace-list,
-.workspace-tab-grid .review-panel-list {
+.workspace-tab-grid .review-panel-list,
+.workspace-tab-grid .mistake-list {
   max-height: none;
 }
 
