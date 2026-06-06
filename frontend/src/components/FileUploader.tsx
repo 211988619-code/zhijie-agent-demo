@@ -10,7 +10,11 @@ type Props = {
 export function FileUploader({ onParsed }: Props) {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [state, setState] = useState<UploadState>({ progress: 0, status: "idle", message: "支持 PDF、DOCX、图片、Markdown、TXT" });
+  const [state, setState] = useState<UploadState>({
+    progress: 0,
+    status: "idle",
+    message: "支持 PDF、DOCX、Markdown、TXT；图片和 .doc 会给出明确提示"
+  });
 
   const handleFile = async (file?: File) => {
     if (!file) return;

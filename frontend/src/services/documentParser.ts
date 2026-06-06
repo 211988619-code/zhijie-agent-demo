@@ -4,6 +4,7 @@ import { conceptIdFromName } from "./masteryService";
 
 const supportedTextTypes = [".md", ".txt"];
 const supportedImageTypes = [".png", ".jpg", ".jpeg"];
+const textDecoder = new TextDecoder("utf-8", { fatal: false });
 
 export function getFileExtension(fileName: string): string {
   const index = fileName.lastIndexOf(".");
@@ -12,6 +13,14 @@ export function getFileExtension(fileName: string): string {
 
 export function isSupportedFile(fileName: string): boolean {
   return [".pdf", ".docx", ".doc", ...supportedImageTypes, ...supportedTextTypes].includes(getFileExtension(fileName));
+}
+
+function extractKeywords(text: string, conceptMap: KnowledgeConcept[]): string[] {
+  const conceptNames = conceptMap.filter((concept) => text.includes(concept.name)).map((concept) => concept.name);
+  const terms = Array.from(text.matchAll(/[A-Za-z][A-Za-z0-9-]{2,}|[\u4e00-\u9fa5]{2,8}/g))
+    .map((match) => match[0])
+    .filter((term) => !/^(the|and|for|with|this|that|from|into|一个|这个|以及|可以|进行|当前)$/.test(term.toLowerCase()));
+  return Array.from(new Set([...conceptNames, ...terms])).slice(0, 12);
 }
 
 export function splitIntoChunks(text: string, fileName: string, conceptMap: KnowledgeConcept[]): CourseChunk[] {
@@ -36,6 +45,7 @@ export function splitIntoChunks(text: string, fileName: string, conceptMap: Know
       text: section,
       sourceTitle: fileName,
       concepts,
+      keywords: extractKeywords(section, conceptMap),
       source: { document: fileName, section: title, chunkId: `${fileName}_chunk_${index + 1}` }
     };
   });
@@ -48,7 +58,7 @@ export function extractConcepts(text: string): KnowledgeConcept[] {
   });
 
   const headingMatches = Array.from(text.matchAll(/^#{1,3}\s+(.+)$/gm)).map((match) => match[1].trim());
-  const quotedMatches = Array.from(text.matchAll(/[“"《]([^”"》]{2,18})[”"》]/g)).map((match) => match[1].trim());
+  const quotedMatches = Array.from(text.matchAll(/[“《]([^”》]{2,18})[”》]/g)).map((match) => match[1].trim());
   [...headingMatches, ...quotedMatches].forEach((name) => {
     if (!name || name.length > 20) return;
     if (!concepts.has(name)) {
@@ -66,82 +76,118 @@ export function extractConcepts(text: string): KnowledgeConcept[] {
   return Array.from(concepts.values()).slice(0, 24);
 }
 
-async function parsePdf(file: File): Promise<{ text: string; partial: boolean }> {
-  const buffer = await file.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  const latin = new TextDecoder("latin1").decode(bytes);
-  const chunks = Array.from(latin.matchAll(/\(([^()]{8,})\)\s*Tj/g)).map((match) => match[1]);
-  const arrays = Array.from(latin.matchAll(/\[((?:.|\n){10,}?)\]\s*TJ/g)).flatMap((match) =>
-    Array.from(match[1].matchAll(/\(([^()]{3,})\)/g)).map((item) => item[1])
-  );
-  const text = [...chunks, ...arrays]
-    .join(" ")
+function decodePdfLiteral(value: string) {
+  return value
     .replace(/\\([()\\])/g, "$1")
-    .replace(/\s+/g, " ")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\n")
+    .replace(/\\t/g, " ")
+    .replace(/\\\d{1,3}/g, " ")
     .trim();
-  if (text.length < 30) {
-    return {
-      partial: true,
-      text: `# ${file.name}\n\nPDF 文件已上传。当前 Demo 使用浏览器端轻量解析，未能稳定提取正文。建议同时上传 Markdown/TXT，或在后续版本启用后端 pdfplumber/pypdf。`
-    };
-  }
-  return { partial: false, text: `# ${file.name}\n\n${text}` };
 }
 
-async function parseDocx(file: File): Promise<{ text: string; partial: boolean }> {
-  const buffer = await file.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
-  const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-  const extracted = Array.from(text.matchAll(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g))
-    .map((match) => match[1].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&"))
-    .join("");
-  if (extracted.trim().length < 20) {
-    return {
-      partial: true,
-      text: `# ${file.name}\n\nDOCX 文件已上传。当前无 mammoth 依赖，轻量解析未能稳定提取正文。建议另存为 TXT/Markdown 上传；后续可接入 mammoth 或 Python 后端 python-docx。`
-    };
-  }
-  return { partial: false, text: `# ${file.name}\n\n${extracted}` };
+function decodePdfHex(value: string) {
+  const clean = value.replace(/\s+/g, "");
+  const bytes = clean.match(/.{1,2}/g)?.map((part) => Number.parseInt(part, 16)).filter((item) => Number.isFinite(item)) ?? [];
+  return textDecoder.decode(new Uint8Array(bytes)).trim();
 }
 
-async function parseImage(file: File): Promise<{ text: string; partial: boolean }> {
-  return {
-    partial: true,
-    text: `# ${file.name}\n\n图片已上传。当前版本无额外 OCR 依赖，已记录为资料文件；建议补充 Markdown/TXT，或在模型设置中使用支持视觉能力的 Provider 做后续识别。`
-  };
+async function parsePdfFile(file: File): Promise<string> {
+  const latin = new TextDecoder("latin1").decode(await file.arrayBuffer());
+  const literalText = Array.from(latin.matchAll(/\(([^()]{3,})\)\s*Tj/g)).map((match) => decodePdfLiteral(match[1]));
+  const arrayText = Array.from(latin.matchAll(/\[((?:.|\n){10,}?)\]\s*TJ/g)).flatMap((match) =>
+    Array.from(match[1].matchAll(/\(([^()]{2,})\)|<([A-Fa-f0-9\s]{4,})>/g)).map((item) => (item[1] ? decodePdfLiteral(item[1]) : decodePdfHex(item[2])))
+  );
+  const hexText = Array.from(latin.matchAll(/<([A-Fa-f0-9\s]{6,})>\s*Tj/g)).map((match) => decodePdfHex(match[1]));
+  const text = [...literalText, ...arrayText, ...hexText].join(" ").replace(/\s+/g, " ").trim();
+  if (text.length < 30) throw new Error("该 PDF 可能是扫描版、加密文件，或文本经过压缩编码，未提取到可用文本。");
+  return `# ${file.name}\n\n${text}`;
+}
+
+function readUInt32LE(view: DataView, offset: number) {
+  return view.getUint32(offset, true);
+}
+
+function readUInt16LE(view: DataView, offset: number) {
+  return view.getUint16(offset, true);
+}
+
+async function inflateRaw(bytes: Uint8Array) {
+  if (typeof DecompressionStream === "undefined") throw new Error("当前浏览器不支持 DOCX 解压，请换用现代浏览器或上传 txt/md。");
+  const body = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  const stream = new Blob([body]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function readZipEntry(buffer: ArrayBuffer, targetName: string): Promise<string | null> {
+  const view = new DataView(buffer);
+  let offset = 0;
+  while (offset + 30 < buffer.byteLength) {
+    if (readUInt32LE(view, offset) !== 0x04034b50) break;
+    const compression = readUInt16LE(view, offset + 8);
+    const compressedSize = readUInt32LE(view, offset + 18);
+    const uncompressedSize = readUInt32LE(view, offset + 22);
+    const nameLength = readUInt16LE(view, offset + 26);
+    const extraLength = readUInt16LE(view, offset + 28);
+    const nameStart = offset + 30;
+    const name = textDecoder.decode(new Uint8Array(buffer, nameStart, nameLength));
+    const dataStart = nameStart + nameLength + extraLength;
+    if (name === targetName) {
+      const compressed = new Uint8Array(buffer, dataStart, compressedSize);
+      const data = compression === 0 ? compressed : compression === 8 ? await inflateRaw(compressed) : null;
+      if (!data) throw new Error("DOCX 使用了当前不支持的压缩方式。");
+      if (uncompressedSize && data.length === 0) throw new Error("DOCX 解压失败，未读取到正文。");
+      return textDecoder.decode(data);
+    }
+    offset = dataStart + compressedSize;
+  }
+  return null;
+}
+
+function xmlText(value: string) {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'");
+}
+
+async function parseDocxFile(file: File): Promise<string> {
+  const documentXml = await readZipEntry(await file.arrayBuffer(), "word/document.xml");
+  if (!documentXml) throw new Error("DOCX 解析失败，未找到正文 document.xml。");
+  const paragraphs = documentXml
+    .split(/<\/w:p>/)
+    .map((paragraph) =>
+      Array.from(paragraph.matchAll(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g))
+        .map((match) => xmlText(match[1]))
+        .join("")
+        .trim()
+    )
+    .filter(Boolean);
+  const text = paragraphs.join("\n\n").trim();
+  if (text.length < 20) throw new Error("DOCX 解析完成，但未提取到足够的正文内容。");
+  return `# ${file.name}\n\n${text}`;
 }
 
 export async function parseDocumentFile(file: File, onState?: (state: UploadState) => void): Promise<ParsedDocument> {
   const extension = getFileExtension(file.name);
-  if (!isSupportedFile(file.name)) {
-    throw new Error("暂不支持该文件类型，请上传 PDF、DOCX、PNG/JPG、Markdown 或 TXT。");
-  }
-  if (extension === ".doc") {
-    throw new Error("浏览器端暂不支持旧版 .doc 解析，请将文件另存为 .docx 后上传。");
-  }
+  if (!isSupportedFile(file.name)) throw new Error("暂不支持该文件类型，请上传 txt/md/pdf/docx。");
+  if (extension === ".doc") throw new Error("暂不支持 .doc，请转换为 .docx 后上传。");
+  if (supportedImageTypes.includes(extension)) throw new Error("暂不支持图片文字识别，请上传 txt/md/pdf/docx，或先将图片内容转为文字。");
 
   onState?.({ progress: 12, status: "reading", message: "正在读取文件..." });
   let text = "";
-  let partial = false;
 
   try {
     if (supportedTextTypes.includes(extension)) {
       text = await file.text();
     } else if (extension === ".pdf") {
       onState?.({ progress: 32, status: "parsing", message: "正在解析 PDF 文本..." });
-      const result = await parsePdf(file);
-      text = result.text;
-      partial = result.partial;
+      text = await parsePdfFile(file);
     } else if (extension === ".docx") {
       onState?.({ progress: 35, status: "parsing", message: "正在解析 Word 文档..." });
-      const result = await parseDocx(file);
-      text = result.text;
-      partial = result.partial;
-    } else if (supportedImageTypes.includes(extension)) {
-      onState?.({ progress: 35, status: "parsing", message: "正在记录图片资料..." });
-      const result = await parseImage(file);
-      text = result.text;
-      partial = result.partial;
+      text = await parseDocxFile(file);
     }
   } catch (error) {
     throw new Error(error instanceof Error ? error.message : "文件解析失败。");
@@ -152,13 +198,14 @@ export async function parseDocumentFile(file: File, onState?: (state: UploadStat
   onState?.({ progress: 72, status: "parsing", message: "正在抽取知识点并切分片段..." });
   const concepts = extractConcepts(text);
   const chunks = splitIntoChunks(text, file.name, concepts.length > 0 ? concepts : initialConcepts);
-  onState?.({ progress: 100, status: partial ? "partial" : "ready", message: partial ? "上传成功，部分解析可用" : "解析成功" });
+  if (chunks.length === 0) throw new Error("已提取文本，但未能生成可用片段。");
+  onState?.({ progress: 100, status: "ready", message: `解析成功：生成 ${chunks.length} 个片段，抽取 ${concepts.length} 个知识点。` });
 
   return {
     id: `doc_${Date.now()}`,
     fileName: file.name,
     fileType: extension.replace(".", ""),
-    status: partial ? "partial" : "ready",
+    status: "ready",
     text,
     chunks,
     concepts,

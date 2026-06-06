@@ -541,25 +541,50 @@ button {
 
 .context-status-card {
   display: grid;
-  gap: 4px;
-  margin: 0 16px 12px;
+  align-self: start;
+  gap: 6px;
+  margin: 0 16px 10px;
   padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: var(--panel-soft);
+  background: color-mix(in srgb, var(--panel) 88%, var(--primary-soft));
   color: var(--text);
   font-size: 12px;
+  height: auto;
+  min-height: unset;
 }
 
-.context-status-card strong {
+.context-status-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.context-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.context-badge.ready {
+  border-color: color-mix(in srgb, var(--primary) 30%, var(--border));
   color: var(--primary);
-  font-size: 13px;
 }
 
-.context-status-card span,
+.context-detail {
+  color: var(--text);
+}
+
 .context-status-card small {
   color: var(--muted);
-  line-height: 1.45;
+  line-height: 1.35;
 }
 
 .settings-page .model-config-panel {
@@ -2254,7 +2279,7 @@ button {
 .chat-panel {
   display: grid;
   min-height: 650px;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto auto 1fr auto;
 }
 
 .message-list {

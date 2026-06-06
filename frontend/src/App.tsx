@@ -23,6 +23,7 @@ import { callLLMAgent, generateKnowledgeCardForConcept, getProviderDefaults } fr
 import { isKnowledgeCardIncomplete, normalizeConceptName, upsertCards } from "./services/knowledgeCardService";
 import { applyQuizResult, conceptIdFromName, getChatFeedbackDelta, updateConceptMastery, upsertMastery } from "./services/masteryService";
 import { checkQuizAnswer, generateQuiz, getBuiltInQuiz } from "./services/quizService";
+import { normalizeTraceRecord, normalizeTraceSteps } from "./services/traceLabels";
 import type {
   AgentTraceStep,
   AgentSession,
@@ -336,7 +337,7 @@ export default function App() {
   const [spaceConcepts, setSpaceConcepts] = useState<SpaceConcept[]>(() => readLocal("spaceConcepts", []));
   const [sessionMessages, setSessionMessages] = useState<Record<string, ChatMessage[]>>(() => readLocal("agentSessionMessages", {}));
   const [sessionInputs, setSessionInputs] = useState<Record<string, string>>(() => readLocal("agentSessionInputs", {}));
-  const [sessionTrace, setSessionTrace] = useState<Record<string, AgentTraceStep[]>>(() => readLocal("agentSessionTrace", {}));
+  const [sessionTrace, setSessionTrace] = useState<Record<string, AgentTraceStep[]>>(() => normalizeTraceRecord(readLocal("agentSessionTrace", {})));
   const [sessionLoading, setSessionLoading] = useState(false);
   const [masteryCollapsed, setMasteryCollapsed] = useState(() => readLocal("masteryCollapsed", false));
   const [cardsCollapsed, setCardsCollapsed] = useState(() => readLocal("cardsCollapsed", false));
@@ -527,10 +528,12 @@ export default function App() {
   const appendTraceSteps = (steps: Omit<AgentTraceStep, "id">[]) => {
     const timestamp = Date.now();
     setTrace((current) => [
-      ...steps.map((step, index) => ({
-        id: `local_trace_${timestamp}_${index}`,
-        ...step
-      })),
+      ...normalizeTraceSteps(
+        steps.map((step, index) => ({
+          id: `local_trace_${timestamp}_${index}`,
+          ...step
+        }))
+      ),
       ...current
     ]);
   };
@@ -1179,7 +1182,7 @@ export default function App() {
     setTrace([
       {
         id: `upload_${Date.now()}`,
-        title: "璧勬枡涓婁紶瑙ｆ瀽",
+        title: "资料解析完成",
         type: "document_parse",
         status: parsed.status === "failed" ? "failed" : "success",
         detail: `${parsed.fileName}: 提取 ${parsed.chunks.length} 个片段，抽取 ${parsed.concepts.length} 个知识点。`
@@ -1203,7 +1206,7 @@ export default function App() {
       });
       setLastRetrievalResults(retrievalResults);
       const result = await callLLMAgent(config, question, parsedDocument.chunks, concepts, mastery, retrievalResults);
-      setTrace(result.trace);
+      setTrace(normalizeTraceSteps(result.trace));
       const confirmedKeys = new Set(concepts.map((concept) => concept.normalizedKey || normalizeConceptName(concept.name)));
       const officialCards = result.cards.filter((card) => confirmedKeys.has(card.normalizedKey || normalizeConceptName(card.name)));
       const temporaryResultCards = result.cards.filter((card) => !confirmedKeys.has(card.normalizedKey || normalizeConceptName(card.name)));
@@ -1299,7 +1302,7 @@ export default function App() {
         `学生问题：${question}`
       ].join("\n");
       const result = await callLLMAgent(config, spacePrompt, parsedDocument.chunks, scopedConcepts, mastery);
-      setSessionTrace((current) => ({ ...current, [sessionId]: result.trace }));
+      setSessionTrace((current) => ({ ...current, [sessionId]: normalizeTraceSteps(result.trace) }));
       setSessionMessages((current) => ({
         ...current,
         [sessionId]: [...(current[sessionId] ?? []), { id: agentId, role: "agent", answer: result.answer }]
@@ -2121,6 +2124,8 @@ export default function App() {
               courseSummary={`${parsedDocument.fileName} · ${concepts.length} 个知识点`}
               goalSummary="目标：一周内完成反向传播与链式法则复习"
               connected={connected}
+              theme={theme}
+              onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
               onModelSettings={() => handleWorkspaceTabChange("settings")}
             />
           }

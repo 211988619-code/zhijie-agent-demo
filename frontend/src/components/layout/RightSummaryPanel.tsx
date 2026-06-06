@@ -1,4 +1,5 @@
-﻿import { Activity, Bot, CalendarCheck, TrendingDown } from "lucide-react";
+import { Activity, Bot, CalendarCheck, TrendingDown } from "lucide-react";
+import { normalizeTraceStep } from "../../services/traceLabels";
 import type { AgentTraceStep, MasteryRecord, ReviewTask } from "../../types";
 
 type Props = {
@@ -22,7 +23,7 @@ function nextSuggestion(mastery: MasteryRecord[], reviewTasks: ReviewTask[], tra
 export function RightSummaryPanel({ mastery, reviewTasks, trace, connected, onOpenReview, onOpenTrace }: Props) {
   const weakConcepts = [...mastery].sort((a, b) => a.score - b.score).slice(0, 3);
   const pendingTasks = reviewTasks.filter((task) => task.status === "pending").slice(0, 3);
-  const latestTrace = trace[trace.length - 1];
+  const latestTrace = trace[trace.length - 1] ? normalizeTraceStep(trace[trace.length - 1]) : undefined;
 
   return (
     <div className="right-summary-stack">
@@ -65,7 +66,7 @@ export function RightSummaryPanel({ mastery, reviewTasks, trace, connected, onOp
           <Bot size={16} />
           <h3>Agent 状态</h3>
         </div>
-        <p className="summary-muted">{connected ? "真实模型已配置" : "当前使用 mock fallback 演示"}</p>
+        <p className="summary-muted">{connected ? "真实模型已配置：success" : "当前使用 mock fallback 演示"}</p>
         <button className="summary-trace-button" onClick={onOpenTrace}>
           <Activity size={14} />
           {latestTrace ? `${latestTrace.title}：${latestTrace.status}` : "暂无执行记录"}
