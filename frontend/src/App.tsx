@@ -46,6 +46,7 @@ import type {
   ThemeMode
 } from "./types";
 import { canonicalizeConceptName } from "./services/conceptIdentity";
+import { processConceptExtraction } from "./services/conceptExtractionService";
 import { classifyConceptFallback, reconcileKnowledgeState, toCandidateConcept, upsertCandidateConcept } from "./services/knowledgeStateService";
 import { retrieveRelevantChunks, type RetrievalResult } from "./services/retrievalService";
 
@@ -544,6 +545,47 @@ export default function App() {
     return pending;
   };
 
+  const addAgentExtractedCandidates = (rawText: string, answerMarkdown: string, answer: { detectedConcepts: { name: string; category: string; status: "existing" | "candidate"; reason?: string }[]; newConceptCandidates: { name: string; category: string; reason: string; confidence: number; shouldAddToCourse: boolean; contextRole?: CandidateConcept["contextRole"]; candidateType?: CandidateConcept["candidateType"]; educationalValue?: number; noiseRisk?: number; granularity?: CandidateConcept["granularity"] }[] }) => {
+    const extraction = processConceptExtraction({
+      sourceType: "chat",
+      rawText,
+      contextText: answerMarkdown,
+      knownConcepts: concepts,
+      pendingCandidates,
+      llmCandidates: [
+        ...answer.detectedConcepts.map((concept) => ({
+          name: concept.name,
+          category: concept.category,
+          reason: concept.reason,
+          confidence: 0.78,
+          shouldAddToCourse: concept.status === "candidate",
+          status: concept.status,
+          contextRole: "explicit_question" as const,
+          candidateType: "concept" as const,
+          educationalValue: concept.status === "candidate" ? 0.76 : 0.84,
+          noiseRisk: 0.18,
+          granularity: "good" as const
+        })),
+        ...answer.newConceptCandidates.map((candidate) => ({
+          name: candidate.name,
+          category: candidate.category,
+          reason: candidate.reason,
+          confidence: candidate.confidence,
+          shouldAddToCourse: candidate.shouldAddToCourse,
+          contextRole: candidate.contextRole,
+          candidateType: candidate.candidateType,
+          educationalValue: candidate.educationalValue,
+          noiseRisk: candidate.noiseRisk,
+          granularity: candidate.granularity
+        }))
+      ]
+    });
+    if (extraction.acceptedCandidates.length > 0) {
+      setPendingCandidates((current) => extraction.acceptedCandidates.reduce((next, candidate) => upsertCandidateConcept(next, candidate, concepts), current));
+    }
+    return extraction;
+  };
+
   const dismissCandidate = (candidate: CandidateConcept) => {
     setPendingCandidates((current) => current.filter((item) => item.normalizedKey !== candidate.normalizedKey));
     setTemporaryCards((current) => current.filter((card) => (card.normalizedKey || normalizeConceptName(card.name)) !== candidate.normalizedKey));
@@ -589,7 +631,7 @@ export default function App() {
       candidate.reason ?? candidate.summary ?? "Confirmed from Materials page",
       0.2,
       undefined,
-      candidate.source
+      (candidate.source === "document" ? "manual" : candidate.source)
     ).then(() => {
       showToast(`Added to knowledge base: ${candidate.canonicalName}`);
     });
@@ -1219,18 +1261,7 @@ export default function App() {
       } else {
         setModelStatus(config.useMockFallback ? "mock" : "missing-key");
       }
-      result.answer.detectedConcepts.forEach((concept) => {
-        const canonical = canonicalizeConceptName(concept.name, [...concepts, ...pendingCandidates]);
-        const exists = concepts.some((item) => (item.normalizedKey || normalizeConceptName(item.name)) === canonical.normalizedKey);
-        if (!exists || concept.status === "candidate") {
-          addPendingCandidate({ name: concept.name, category: concept.category, reason: concept.reason, source: "chat" }, "chat");
-        }
-      });
-      result.answer.newConceptCandidates.forEach((candidate) => {
-        if (candidate.shouldAddToCourse) {
-          addPendingCandidate({ name: candidate.name, category: candidate.category, reason: candidate.reason, source: "chat" }, "chat");
-        }
-      });
+      addAgentExtractedCandidates(question, result.answer.answerMarkdown, result.answer);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Model call failed";
       setModelStatus("error");
@@ -1399,18 +1430,7 @@ export default function App() {
           )
         );
       }
-      result.answer.detectedConcepts.forEach((concept) => {
-        const canonical = canonicalizeConceptName(concept.name, [...concepts, ...pendingCandidates]);
-        const exists = concepts.some((item) => (item.normalizedKey || normalizeConceptName(item.name)) === canonical.normalizedKey);
-        if (!exists || concept.status === "candidate") {
-          addPendingCandidate({ name: concept.name, category: concept.category, reason: concept.reason, source: "chat" }, "chat");
-        }
-      });
-      result.answer.newConceptCandidates.forEach((candidate) => {
-        if (candidate.shouldAddToCourse) {
-          addPendingCandidate({ name: candidate.name, category: candidate.category, reason: candidate.reason, source: "chat" }, "chat");
-        }
-      });
+      addAgentExtractedCandidates(question, result.answer.answerMarkdown, result.answer);
     } catch (error) {
       setSessionMessages((current) => ({
         ...current,
@@ -2346,7 +2366,7 @@ export default function App() {
                                 candidate.reason || "",
                                 candidateInitialScores[candidate.normalizedKey] ?? 0.15,
                                 undefined,
-                                candidate.source
+                                (candidate.source === "document" ? "manual" : candidate.source)
                               )
                             }
                           >确认加入</button>

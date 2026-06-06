@@ -1,5 +1,6 @@
 import type { CourseChunk, KnowledgeConcept, ParsedDocument, UploadState } from "../types";
 import { initialConcepts } from "../data/demoCourse";
+import { processConceptExtraction } from "./conceptExtractionService";
 import { conceptIdFromName } from "./masteryService";
 
 const supportedTextTypes = [".md", ".txt"];
@@ -44,21 +45,47 @@ export function splitIntoChunks(text: string, fileName: string, conceptMap: Know
 export function extractConcepts(text: string): KnowledgeConcept[] {
   const concepts = new Map<string, KnowledgeConcept>();
   initialConcepts.forEach((concept) => {
-    if (text.includes(concept.name)) concepts.set(concept.name, concept);
+    const names = [concept.name, concept.canonicalName, ...(concept.aliases ?? [])].filter((name): name is string => Boolean(name));
+    if (names.some((name) => text.includes(name))) concepts.set(concept.normalizedKey || concept.name, concept);
   });
 
   const headingMatches = Array.from(text.matchAll(/^#{1,3}\s+(.+)$/gm)).map((match) => match[1].trim());
-  const quotedMatches = Array.from(text.matchAll(/[“"《]([^”"》]{2,18})[”"》]/g)).map((match) => match[1].trim());
-  [...headingMatches, ...quotedMatches].forEach((name) => {
-    if (!name || name.length > 20) return;
-    if (!concepts.has(name)) {
-      concepts.set(name, {
-        id: conceptIdFromName(name),
-        name,
-        category: "待确认新概念",
+  const quotedMatches = Array.from(text.matchAll(/[\u201c"\u300a]([^\u201d"\u300b]{2,18})[\u201d"\u300b]/g)).map((match) => match[1].trim());
+  const llmCandidates = [...headingMatches, ...quotedMatches]
+    .filter((name) => name && name.length <= 40)
+    .map((name) => ({
+      name,
+      confidence: 0.62,
+      shouldAddToCourse: true,
+      reason: "\u4ece\u4e0a\u4f20\u8d44\u6599\u6807\u9898\u6216\u5f3a\u8c03\u6587\u672c\u4e2d\u62bd\u53d6",
+      contextRole: "main_topic" as const,
+      candidateType: "concept" as const,
+      educationalValue: 0.62,
+      noiseRisk: 0.32,
+      granularity: "good" as const
+    }));
+
+  const extraction = processConceptExtraction({
+    sourceType: "document",
+    rawText: text,
+    contextText: text.slice(0, 6000),
+    knownConcepts: initialConcepts,
+    pendingCandidates: [],
+    llmCandidates
+  });
+
+  extraction.acceptedCandidates.forEach((candidate) => {
+    if (!concepts.has(candidate.normalizedKey)) {
+      concepts.set(candidate.normalizedKey, {
+        id: conceptIdFromName(candidate.canonicalName),
+        name: candidate.canonicalName,
+        canonicalName: candidate.canonicalName,
+        aliases: candidate.aliases,
+        normalizedKey: candidate.normalizedKey,
+        category: candidate.suggestedCategory || "\u5f85\u786e\u8ba4\u65b0\u6982\u5ff5",
         status: "candidate",
-        confidence: 0.62,
-        reason: "从上传资料标题或强调文本中抽取"
+        confidence: candidate.extractionConfidence ?? 0.62,
+        reason: candidate.reason
       });
     }
   });

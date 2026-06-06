@@ -50,7 +50,8 @@ function candidateSourceLabel(source: CandidateConcept["source"]) {
     chat: "问答反馈",
     quiz: "测验结果",
     quiz_explanation: "测验解析",
-    related_concept: "关联概念"
+    related_concept: "关联概念",
+    document: "\u8bfe\u7a0b\u8d44\u6599"
   };
   return labels[source] ?? source;
 }

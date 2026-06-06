@@ -110,6 +110,14 @@ answerMarkdown 字段是给学生看的最终回答：
 - 数学公式必须使用 Markdown LaTeX：行内公式 $...$，块级公式 $$...$$。
 - 不要使用 HTML 公式。
 
+Concept extraction rules:
+- detectedConcepts should only include real teachable concepts, methods, models, algorithms, theorems, skills, misconceptions, or applications.
+- Do not list greetings, filler words, task verbs, generic nouns, or broad labels such as math/model/code/knowledge point/course as ordinary concepts.
+- newConceptCandidates should include only course-external but educationally valuable concepts worth pending review.
+- If a term is only casually mentioned, do not include it as a new candidate.
+- For each new candidate, estimate contextRole, candidateType, educationalValue, noiseRisk, and granularity.
+
+
 JSON Schema：
 {
   "taskType": "course_qa",
@@ -128,7 +136,12 @@ JSON Schema：
       "category": "分类",
       "confidence": 0.82,
       "shouldAddToCourse": true,
-      "reason": "为什么建议加入"
+      "reason": "why this concept should be added",
+      "contextRole": "main_topic/explicit_question/key_prerequisite/application/passing_mention/social/unknown",
+      "candidateType": "concept/method/algorithm/model/theorem/skill/misconception/application/task/unknown",
+      "educationalValue": 0.0,
+      "noiseRisk": 0.0,
+      "granularity": "good/too_broad/too_narrow/invalid/unknown"
     }
   ],
   "agentTrace": [
@@ -177,6 +190,28 @@ function asStringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item) => typeof item === "string") : [];
 }
 
+function asContextRole(value: unknown): NewConceptCandidate["contextRole"] {
+  return ["main_topic", "explicit_question", "key_prerequisite", "application", "example", "passing_mention", "social", "unknown"].includes(String(value))
+    ? (String(value) as NewConceptCandidate["contextRole"])
+    : undefined;
+}
+
+function asCandidateType(value: unknown): NewConceptCandidate["candidateType"] {
+  return ["concept", "method", "algorithm", "model", "theorem", "skill", "misconception", "application", "task", "unknown"].includes(String(value))
+    ? (String(value) as NewConceptCandidate["candidateType"])
+    : undefined;
+}
+
+function asGranularity(value: unknown): NewConceptCandidate["granularity"] {
+  return ["good", "too_broad", "too_narrow", "invalid", "unknown"].includes(String(value))
+    ? (String(value) as NewConceptCandidate["granularity"])
+    : undefined;
+}
+
+function asScore(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : undefined;
+}
+
 function normalizeLLMResult(raw: unknown, mode: "llm" | "mock", fallbackSources: SourceRef[]): StructuredLLMResult {
   const data = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   const detectedConcepts = Array.isArray(data.detectedConcepts)
@@ -197,7 +232,12 @@ function normalizeLLMResult(raw: unknown, mode: "llm" | "mock", fallbackSources:
           category: String(item.category ?? "待确认新概念"),
           confidence: typeof item.confidence === "number" ? item.confidence : 0.5,
           shouldAddToCourse: Boolean(item.shouldAddToCourse),
-          reason: String(item.reason ?? "")
+          reason: String(item.reason ?? ""),
+          contextRole: asContextRole(item.contextRole),
+          candidateType: asCandidateType(item.candidateType),
+          educationalValue: asScore(item.educationalValue),
+          noiseRisk: asScore(item.noiseRisk),
+          granularity: asGranularity(item.granularity)
         })
       )
     : [];

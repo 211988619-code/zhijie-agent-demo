@@ -32,6 +32,8 @@ export type KnowledgeConcept = {
   createdAt?: string;
 };
 
+export type ConceptExtractionSource = "chat" | "quiz" | "quiz_explanation" | "related_concept" | "document";
+
 export type CandidateConcept = {
   id: string;
   canonicalName: string;
@@ -40,9 +42,37 @@ export type CandidateConcept = {
   suggestedCategory?: string;
   summary?: string;
   reason?: string;
-  source: "chat" | "quiz" | "quiz_explanation" | "related_concept";
+  source: ConceptExtractionSource;
   status: "pending";
   createdAt: string;
+  surfaceText?: string;
+  candidateType?: "concept" | "method" | "algorithm" | "model" | "theorem" | "skill" | "misconception" | "application" | "task" | "unknown";
+  contextRole?: "main_topic" | "explicit_question" | "key_prerequisite" | "application" | "example" | "passing_mention" | "social" | "unknown";
+  educationalValue?: number;
+  noiseRisk?: number;
+  granularity?: "good" | "too_broad" | "too_narrow" | "invalid" | "unknown";
+  extractionConfidence?: number;
+  matchedConceptId?: string;
+  decision?: "reject" | "link_existing" | "pending_review" | "create_stub" | "create_full_card";
+  decisionReason?: string;
+};
+
+export type ExtractedConceptCandidate = {
+  surfaceText: string;
+  canonicalName: string;
+  aliases: string[];
+  normalizedKey: string;
+  suggestedCategory?: string;
+  candidateType: NonNullable<CandidateConcept["candidateType"]>;
+  contextRole: NonNullable<CandidateConcept["contextRole"]>;
+  educationalValue: number;
+  noiseRisk: number;
+  granularity: NonNullable<CandidateConcept["granularity"]>;
+  shouldCreateOrLinkCard: boolean;
+  matchedConceptId?: string;
+  decision: NonNullable<CandidateConcept["decision"]>;
+  reason: string;
+  confidence: number;
 };
 
 export type ConfirmedConcept = {
@@ -129,6 +159,11 @@ export type NewConceptCandidate = {
   confidence: number;
   shouldAddToCourse: boolean;
   reason: string;
+  contextRole?: CandidateConcept["contextRole"];
+  candidateType?: CandidateConcept["candidateType"];
+  educationalValue?: number;
+  noiseRisk?: number;
+  granularity?: CandidateConcept["granularity"];
 };
 
 export type AgentTraceStep = {

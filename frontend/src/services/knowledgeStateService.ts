@@ -1,11 +1,26 @@
-import type { CandidateConcept, KnowledgeCard, KnowledgeConcept, MasteryRecord, NewConceptCandidate } from "../types";
+import type { CandidateConcept, ConceptExtractionSource, KnowledgeCard, KnowledgeConcept, MasteryRecord, NewConceptCandidate } from "../types";
 import { canonicalizeConceptName, mergeAliases, normalizeConceptKey } from "./conceptIdentity";
 import { normalizeCard, upsertCards } from "./knowledgeCardService";
 import { conceptIdFromName, upsertMastery } from "./masteryService";
 
 const now = () => new Date().toISOString();
 
-type CandidateInput = NewConceptCandidate | { name: string; category?: string; reason?: string; source?: CandidateConcept["source"] };
+type CandidateInput = NewConceptCandidate | {
+  name: string;
+  category?: string;
+  reason?: string;
+  source?: ConceptExtractionSource;
+  surfaceText?: string;
+  candidateType?: CandidateConcept["candidateType"];
+  contextRole?: CandidateConcept["contextRole"];
+  educationalValue?: number;
+  noiseRisk?: number;
+  granularity?: CandidateConcept["granularity"];
+  extractionConfidence?: number;
+  matchedConceptId?: string;
+  decision?: CandidateConcept["decision"];
+  decisionReason?: string;
+};
 
 export function toCandidateConcept(
   candidate: CandidateInput,
@@ -23,7 +38,49 @@ export function toCandidateConcept(
     reason: candidate.reason,
     source: "source" in candidate && candidate.source ? candidate.source : source,
     status: "pending",
-    createdAt: now()
+    createdAt: now(),
+    surfaceText: "surfaceText" in candidate ? candidate.surfaceText : candidate.name,
+    candidateType: "candidateType" in candidate ? candidate.candidateType : undefined,
+    contextRole: "contextRole" in candidate ? candidate.contextRole : undefined,
+    educationalValue: "educationalValue" in candidate ? candidate.educationalValue : undefined,
+    noiseRisk: "noiseRisk" in candidate ? candidate.noiseRisk : undefined,
+    granularity: "granularity" in candidate ? candidate.granularity : undefined,
+    extractionConfidence: "extractionConfidence" in candidate ? candidate.extractionConfidence : "confidence" in candidate ? candidate.confidence : undefined,
+    matchedConceptId: "matchedConceptId" in candidate ? candidate.matchedConceptId : undefined,
+    decision: "decision" in candidate ? candidate.decision : undefined,
+    decisionReason: "decisionReason" in candidate ? candidate.decisionReason : candidate.reason
+  };
+}
+
+function mostInformative(current?: string, incoming?: string) {
+  if (!incoming) return current;
+  if (!current) return incoming;
+  return incoming.length > current.length ? incoming : current;
+}
+
+function mergeCandidateConcept(existing: CandidateConcept, incoming: CandidateConcept): CandidateConcept {
+  return {
+    ...existing,
+    aliases: mergeAliases(existing.aliases, incoming.aliases, existing.canonicalName),
+    suggestedCategory: incoming.suggestedCategory || existing.suggestedCategory,
+    summary: mostInformative(existing.summary, incoming.summary),
+    reason: mostInformative(existing.reason, incoming.reason),
+    source: incoming.source || existing.source,
+    surfaceText: existing.surfaceText || incoming.surfaceText,
+    candidateType: incoming.candidateType || existing.candidateType,
+    contextRole: incoming.contextRole || existing.contextRole,
+    educationalValue: Math.max(existing.educationalValue ?? 0, incoming.educationalValue ?? 0) || existing.educationalValue || incoming.educationalValue,
+    noiseRisk:
+      existing.noiseRisk === undefined
+        ? incoming.noiseRisk
+        : incoming.noiseRisk === undefined
+          ? existing.noiseRisk
+          : Math.min(existing.noiseRisk, incoming.noiseRisk),
+    granularity: incoming.granularity === "good" ? incoming.granularity : existing.granularity || incoming.granularity,
+    extractionConfidence: Math.max(existing.extractionConfidence ?? 0, incoming.extractionConfidence ?? 0) || existing.extractionConfidence || incoming.extractionConfidence,
+    matchedConceptId: existing.matchedConceptId || incoming.matchedConceptId,
+    decision: existing.decision === "link_existing" || incoming.decision === "link_existing" ? "link_existing" : incoming.decision || existing.decision,
+    decisionReason: mostInformative(existing.decisionReason, incoming.decisionReason)
   };
 }
 
@@ -33,18 +90,7 @@ export function upsertCandidateConcept(candidates: CandidateConcept[], incoming:
 
   const existing = candidates.find((candidate) => candidate.normalizedKey === incoming.normalizedKey);
   if (!existing) return [incoming, ...candidates];
-  return candidates.map((candidate) =>
-    candidate.normalizedKey === incoming.normalizedKey
-      ? {
-          ...candidate,
-          aliases: mergeAliases(candidate.aliases, incoming.aliases, candidate.canonicalName),
-          suggestedCategory: incoming.suggestedCategory || candidate.suggestedCategory,
-          summary: incoming.summary || candidate.summary,
-          reason: incoming.reason || candidate.reason,
-          source: incoming.source || candidate.source
-        }
-      : candidate
-  );
+  return candidates.map((candidate) => (candidate.normalizedKey === incoming.normalizedKey ? mergeCandidateConcept(candidate, incoming) : candidate));
 }
 
 export function classifyConceptFallback(conceptName: string, aliases: string[] = []) {
@@ -146,15 +192,16 @@ export function reconcileKnowledgeState({
     const canonical = canonicalizeConceptName(candidate.canonicalName, [...reconciledConcepts, ...Array.from(candidateByKey.values())]);
     if (confirmedKeys.has(canonical.normalizedKey)) return;
     const existing = candidateByKey.get(canonical.normalizedKey);
-    candidateByKey.set(canonical.normalizedKey, {
+    const normalizedCandidate: CandidateConcept = {
       ...candidate,
-      ...existing,
       id: `candidate_${canonical.normalizedKey}`,
       canonicalName: canonical.canonicalName,
-      aliases: mergeAliases(existing?.aliases, [...(candidate.aliases ?? []), ...canonical.aliases], canonical.canonicalName),
+      aliases: mergeAliases(candidate.aliases ?? [], canonical.aliases, canonical.canonicalName),
       normalizedKey: canonical.normalizedKey,
+      suggestedCategory: candidate.suggestedCategory === "\u5f85\u786e\u8ba4\u65b0\u6982\u5ff5" ? undefined : candidate.suggestedCategory,
       status: "pending"
-    });
+    };
+    candidateByKey.set(canonical.normalizedKey, existing ? mergeCandidateConcept(existing, normalizedCandidate) : normalizedCandidate);
   });
 
   return {
