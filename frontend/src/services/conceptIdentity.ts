@@ -42,6 +42,61 @@ const preferredCase: Record<string, string> = {
   transformer: "Transformer"
 };
 
+type TerminologyEntry = {
+  canonicalName: string;
+  aliases: string[];
+  categoryHint?: string;
+  preserveCanonical?: boolean;
+};
+
+const csTerminology: TerminologyEntry[] = [
+  { canonicalName: "\u64cd\u4f5c\u7cfb\u7edf", aliases: ["Operating System", "Operating Systems", "OS"], categoryHint: "\u64cd\u4f5c\u7cfb\u7edf" },
+  { canonicalName: "\u8fdb\u7a0b", aliases: ["Process", "Processes"], categoryHint: "\u64cd\u4f5c\u7cfb\u7edf" },
+  { canonicalName: "\u7ebf\u7a0b", aliases: ["Thread", "Threads"], categoryHint: "\u64cd\u4f5c\u7cfb\u7edf" },
+  { canonicalName: "\u865a\u62df\u5185\u5b58", aliases: ["Virtual Memory"], categoryHint: "\u64cd\u4f5c\u7cfb\u7edf" },
+  { canonicalName: "\u6587\u4ef6\u7cfb\u7edf", aliases: ["File System", "File Systems"], categoryHint: "\u64cd\u4f5c\u7cfb\u7edf" },
+  { canonicalName: "\u8fdb\u7a0b\u8c03\u5ea6", aliases: ["Process Scheduling", "CPU Scheduling", "Scheduling"], categoryHint: "\u64cd\u4f5c\u7cfb\u7edf" },
+  { canonicalName: "\u6b7b\u9501", aliases: ["Deadlock", "Deadlocks"], categoryHint: "\u64cd\u4f5c\u7cfb\u7edf" },
+  { canonicalName: "\u8ba1\u7b97\u673a\u7f51\u7edc", aliases: ["Computer Network", "Computer Networks", "Computer Networking"], categoryHint: "\u8ba1\u7b97\u673a\u7f51\u7edc" },
+  { canonicalName: "TCP", aliases: ["Transmission Control Protocol", "\u4f20\u8f93\u63a7\u5236\u534f\u8bae"], categoryHint: "\u8ba1\u7b97\u673a\u7f51\u7edc", preserveCanonical: true },
+  { canonicalName: "IP", aliases: ["Internet Protocol", "\u7f51\u9645\u534f\u8bae"], categoryHint: "\u8ba1\u7b97\u673a\u7f51\u7edc", preserveCanonical: true },
+  { canonicalName: "DNS", aliases: ["Domain Name System", "\u57df\u540d\u7cfb\u7edf"], categoryHint: "\u8ba1\u7b97\u673a\u7f51\u7edc", preserveCanonical: true },
+  { canonicalName: "HTTP", aliases: ["HyperText Transfer Protocol", "Hypertext Transfer Protocol", "\u8d85\u6587\u672c\u4f20\u8f93\u534f\u8bae"], categoryHint: "\u8ba1\u7b97\u673a\u7f51\u7edc", preserveCanonical: true },
+  { canonicalName: "\u62e5\u585e\u63a7\u5236", aliases: ["Congestion Control"], categoryHint: "\u8ba1\u7b97\u673a\u7f51\u7edc" },
+  { canonicalName: "\u8def\u7531", aliases: ["Routing"], categoryHint: "\u8ba1\u7b97\u673a\u7f51\u7edc" },
+  { canonicalName: "\u6570\u636e\u5e93\u4e8b\u52a1", aliases: ["Database Transaction", "Database Transactions", "Transaction", "Transactions"], categoryHint: "\u6570\u636e\u5e93\u7cfb\u7edf" },
+  { canonicalName: "SQL", aliases: ["Structured Query Language", "\u7ed3\u6784\u5316\u67e5\u8be2\u8bed\u8a00"], categoryHint: "\u6570\u636e\u5e93\u7cfb\u7edf", preserveCanonical: true },
+  { canonicalName: "\u7d22\u5f15", aliases: ["Index", "Indexing", "Database Index"], categoryHint: "\u6570\u636e\u5e93\u7cfb\u7edf" },
+  { canonicalName: "\u8303\u5f0f", aliases: ["Normal Form", "Normalization"], categoryHint: "\u6570\u636e\u5e93\u7cfb\u7edf" },
+  { canonicalName: "\u8bcd\u6cd5\u5206\u6790", aliases: ["Lexical Analysis", "Lexing"], categoryHint: "\u7f16\u8bd1\u539f\u7406" },
+  { canonicalName: "\u8bed\u6cd5\u5206\u6790", aliases: ["Syntax Analysis", "Parsing"], categoryHint: "\u7f16\u8bd1\u539f\u7406" },
+  { canonicalName: "\u4e2d\u95f4\u4ee3\u7801", aliases: ["Intermediate Representation", "Intermediate Code", "IR"], categoryHint: "\u7f16\u8bd1\u539f\u7406" },
+  { canonicalName: "\u5bc4\u5b58\u5668\u5206\u914d", aliases: ["Register Allocation"], categoryHint: "\u7f16\u8bd1\u539f\u7406" },
+  { canonicalName: "\u7f13\u5b58", aliases: ["Cache"], categoryHint: "\u8ba1\u7b97\u673a\u7cfb\u7edf" },
+  { canonicalName: "\u7f13\u5b58\u4e00\u81f4\u6027", aliases: ["Cache Coherence", "Cache Coherency"], categoryHint: "\u8ba1\u7b97\u673a\u7cfb\u7edf" },
+  { canonicalName: "\u6307\u4ee4\u6d41\u6c34\u7ebf", aliases: ["Instruction Pipeline", "Pipelining"], categoryHint: "\u8ba1\u7b97\u673a\u7cfb\u7edf" },
+  { canonicalName: "\u603b\u7ebf", aliases: ["Bus"], categoryHint: "\u8ba1\u7b97\u673a\u7cfb\u7edf" },
+  { canonicalName: "\u5730\u5740", aliases: ["Address"], categoryHint: "\u8ba1\u7b97\u673a\u7cfb\u7edf" },
+  { canonicalName: "\u94fe\u8868", aliases: ["Linked List"], categoryHint: "\u6570\u636e\u7ed3\u6784\u4e0e\u7b97\u6cd5" },
+  { canonicalName: "\u52a8\u6001\u89c4\u5212", aliases: ["Dynamic Programming", "DP"], categoryHint: "\u6570\u636e\u7ed3\u6784\u4e0e\u7b97\u6cd5" },
+  { canonicalName: "CNN", aliases: ["Convolutional Neural Network", "\u5377\u79ef\u795e\u7ecf\u7f51\u7edc"], categoryHint: "\u6df1\u5ea6\u5b66\u4e60", preserveCanonical: true },
+  { canonicalName: "RNN", aliases: ["Recurrent Neural Network", "\u5faa\u73af\u795e\u7ecf\u7f51\u7edc"], categoryHint: "\u6df1\u5ea6\u5b66\u4e60", preserveCanonical: true },
+  { canonicalName: "BERT", aliases: ["Bidirectional Encoder Representations from Transformers"], categoryHint: "\u81ea\u7136\u8bed\u8a00\u5904\u7406", preserveCanonical: true },
+  { canonicalName: "GPT", aliases: ["Generative Pre-trained Transformer", "Generative Pretrained Transformer"], categoryHint: "\u81ea\u7136\u8bed\u8a00\u5904\u7406", preserveCanonical: true }
+];
+
+function terminologyOwnerFor(value: string) {
+  const keys = splitComposite(value).map(normalizeConceptKey);
+  return csTerminology.find((entry) => {
+    const entryKeys = [entry.canonicalName, ...entry.aliases].map(normalizeConceptKey);
+    return keys.some((key) => entryKeys.includes(key));
+  });
+}
+
+export function getTerminologyCategoryHint(value: string) {
+  return terminologyOwnerFor(value)?.categoryHint;
+}
+
 export type CanonicalConcept = {
   canonicalName: string;
   aliases: string[];
@@ -130,7 +185,8 @@ export function resolveKnownConcept(
   input: string,
   knownConcepts: Array<KnowledgeConcept | ConfirmedConcept | CandidateConcept> = []
 ) {
-  const inputKeys = splitComposite(input).map(normalizeConceptKey);
+  const terminology = terminologyOwnerFor(input);
+  const inputKeys = [...splitComposite(input), ...(terminology ? [terminology.canonicalName, ...terminology.aliases] : [])].map(normalizeConceptKey);
   return knownConcepts.find((concept) => {
     const canonicalName = getConceptName(concept);
     const normalizedKey = "normalizedKey" in concept && concept.normalizedKey ? concept.normalizedKey : normalizeConceptKey(canonicalName);
@@ -160,18 +216,24 @@ export function canonicalizeConceptName(
   let canonicalName = raw;
   const aliases: string[] = [];
   const parts = splitComposite(raw);
-  const owner = parts.map(aliasOwnerFor).find(Boolean);
-  if (owner) {
-    canonicalName = preferredCase[owner] ?? owner.toUpperCase();
-    aliases.push(...parts, ...(abbreviationAliases[owner] ?? []));
+  const terminology = terminologyOwnerFor(raw);
+  if (terminology) {
+    canonicalName = terminology.canonicalName;
+    aliases.push(...parts, ...terminology.aliases, raw);
   } else {
-    const abbreviationPart = parts.find(looksLikeAbbreviation);
-    if (abbreviationPart) {
-      canonicalName = preferredName(abbreviationPart);
-      aliases.push(...parts);
+    const owner = parts.map(aliasOwnerFor).find(Boolean);
+    if (owner) {
+      canonicalName = preferredCase[owner] ?? owner.toUpperCase();
+      aliases.push(...parts, ...(abbreviationAliases[owner] ?? []));
     } else {
-      canonicalName = parts[0] ?? raw;
-      aliases.push(...parts.slice(1), raw);
+      const abbreviationPart = parts.find(looksLikeAbbreviation);
+      if (abbreviationPart) {
+        canonicalName = preferredName(abbreviationPart);
+        aliases.push(...parts);
+      } else {
+        canonicalName = parts[0] ?? raw;
+        aliases.push(...parts.slice(1), raw);
+      }
     }
   }
 

@@ -19,7 +19,7 @@ import { ModelSettings } from "./components/ModelSettings";
 import { QuizPanel } from "./components/QuizPanel";
 import { ReviewTaskPanel } from "./components/ReviewTaskPanel";
 import { builtInDocument, builtInQuizBank, initialCards, initialConcepts, initialMastery } from "./data/demoCourse";
-import { callLLMAgent, generateKnowledgeCardForConcept, getProviderDefaults } from "./services/llmClient";
+import { callLLMAgent, classifyConceptForKnowledgeBase, extractDocumentConceptsWithLLM, generateKnowledgeCardForConcept, getProviderDefaults } from "./services/llmClient";
 import { isKnowledgeCardIncomplete, normalizeConceptName, upsertCards } from "./services/knowledgeCardService";
 import { applyQuizResult, conceptIdFromName, getChatFeedbackDelta, updateConceptMastery, upsertMastery } from "./services/masteryService";
 import { checkQuizAnswer, generateQuiz, getBuiltInQuiz } from "./services/quizService";
@@ -48,7 +48,7 @@ import type {
 } from "./types";
 import { canonicalizeConceptName } from "./services/conceptIdentity";
 import { processConceptExtraction } from "./services/conceptExtractionService";
-import { classifyConceptFallback, reconcileKnowledgeState, toCandidateConcept, upsertCandidateConcept } from "./services/knowledgeStateService";
+import { classifyConceptFallback, isPendingCategoryLabel, reconcileKnowledgeState, reconcilePendingCandidatesAndTemporaryCards, sanitizeKnowledgeCategory, toCandidateConcept, upsertCandidateConcept } from "./services/knowledgeStateService";
 import { retrieveRelevantChunks, type RetrievalResult } from "./services/retrievalService";
 
 type RightPanelMode = "trace" | "mistakes" | "review" | "modelConfig";
@@ -354,6 +354,7 @@ export default function App() {
   const activeSessionIdRef = useRef(activeSessionId);
   const generatingSessionIdsRef = useRef(new Set<string>());
   const appMenuCloseTimerRef = useRef<number | null>(null);
+  const knowledgeSyncGuardRef = useRef(false);
 
   const [config, setConfig] = useState<LLMConfig>(() => ({ ...defaultConfig, ...readLocal<Partial<LLMConfig>>(MODEL_CONFIG_STORAGE_KEY, {}) }));
   const [modelStatus, setModelStatus] = useState<ModelConnectionStatus>(() => (readLocal<Partial<LLMConfig>>(MODEL_CONFIG_STORAGE_KEY, {}).apiKey ? "mock" : "missing-key"));
@@ -474,6 +475,33 @@ export default function App() {
   useEffect(() => writeLocal("lastVisitedMainPage", lastVisitedMainPage), [lastVisitedMainPage]);
   useEffect(() => writeLocal(MODEL_CONFIG_STORAGE_KEY, config), [config]);
 
+  useEffect(() => {
+    if (knowledgeSyncGuardRef.current) return;
+    const sync = reconcilePendingCandidatesAndTemporaryCards({
+      pendingCandidates,
+      temporaryCards,
+      confirmedConcepts: concepts
+    });
+    const pendingChanged = JSON.stringify(sync.pendingCandidates) !== JSON.stringify(pendingCandidates);
+    const cardsChanged = JSON.stringify(sync.temporaryCards) !== JSON.stringify(temporaryCards);
+    if (!pendingChanged && !cardsChanged) return;
+    knowledgeSyncGuardRef.current = true;
+    if (pendingChanged) setPendingCandidates(sync.pendingCandidates);
+    if (cardsChanged) setTemporaryCards(sync.temporaryCards);
+    queueMicrotask(() => {
+      knowledgeSyncGuardRef.current = false;
+    });
+    const devEnv = (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV;
+    if (devEnv) {
+      console.debug("[knowledge-sync]", {
+        pendingCandidates: sync.pendingCandidates.length,
+        temporaryCards: sync.temporaryCards.length,
+        missingTemporaryCards: sync.missingTemporaryCards,
+        orphanTemporaryCards: sync.orphanTemporaryCards
+      });
+    }
+  }, [pendingCandidates, temporaryCards, concepts]);
+
   const categories = useMemo(() => Array.from(new Set(cards.map((card) => card.category))), [cards]);
   const drawerCards = useMemo(() => upsertCards(cards, temporaryCards), [cards, temporaryCards]);
   const [activeCategory, setActiveCategory] = useState("全部");
@@ -560,14 +588,14 @@ export default function App() {
           name: concept.name,
           category: concept.category,
           reason: concept.reason,
-          confidence: 0.78,
+          confidence: concept.status === "existing" ? 0.78 : 0.52,
           shouldAddToCourse: concept.status === "candidate",
           status: concept.status,
-          contextRole: "explicit_question" as const,
-          candidateType: "concept" as const,
-          educationalValue: concept.status === "candidate" ? 0.76 : 0.84,
-          noiseRisk: 0.18,
-          granularity: "good" as const
+          contextRole: concept.status === "existing" ? ("explicit_question" as const) : ("unknown" as const),
+          candidateType: concept.status === "existing" ? ("concept" as const) : ("unknown" as const),
+          educationalValue: concept.status === "existing" ? 0.84 : 0.52,
+          noiseRisk: concept.status === "existing" ? 0.18 : 0.42,
+          granularity: concept.status === "existing" ? ("good" as const) : ("unknown" as const)
         })),
         ...answer.newConceptCandidates.map((candidate) => ({
           name: candidate.name,
@@ -585,6 +613,11 @@ export default function App() {
     });
     if (extraction.acceptedCandidates.length > 0) {
       setPendingCandidates((current) => extraction.acceptedCandidates.reduce((next, candidate) => upsertCandidateConcept(next, candidate, concepts), current));
+      ensureTemporaryCardsForCandidates(extraction.acceptedCandidates, {
+        source: "chat",
+        userQuestion: rawText,
+        currentAnswerMarkdown: answerMarkdown
+      });
     }
     return extraction;
   };
@@ -975,6 +1008,37 @@ export default function App() {
     return withRelated;
   };
 
+  const ensureTemporaryCardsForCandidates = (
+    candidates: CandidateConcept[],
+    options: {
+      source?: "chat" | "quiz" | "quiz_explanation" | "related_concept" | "prerequisite" | "manual";
+      sourceText?: string;
+      userQuestion?: string;
+      currentAnswerMarkdown?: string;
+      currentQuizQuestion?: QuizQuestion;
+    } = {}
+  ) => {
+    const confirmedKeys = new Set(concepts.map((concept) => concept.normalizedKey || normalizeConceptName(concept.name)));
+    const cardKeys = new Set([...cards, ...temporaryCards].map((card) => card.normalizedKey || normalizeConceptName(card.name)));
+    const targets = candidates
+      .filter((candidate) => !confirmedKeys.has(candidate.normalizedKey) && !cardKeys.has(candidate.normalizedKey))
+      .sort((a, b) => (b.educationalValue ?? 0) - (a.educationalValue ?? 0))
+      .slice(0, 4);
+    if (targets.length === 0) return;
+    void Promise.allSettled(
+      targets.map((candidate) =>
+        ensureKnowledgeCard(candidate.canonicalName, {
+          category: candidate.suggestedCategory,
+          source: options.source || (candidate.source === "document" ? "manual" : candidate.source),
+          sourceText: options.sourceText || candidate.reason,
+          userQuestion: options.userQuestion,
+          currentAnswerMarkdown: options.currentAnswerMarkdown,
+          currentQuizQuestion: options.currentQuizQuestion
+        })
+      )
+    );
+  };
+
   const openCardWithGeneratedFallback = async (
     conceptName: string,
     options: Parameters<typeof ensureKnowledgeCard>[1] = {}
@@ -1190,6 +1254,29 @@ export default function App() {
     await startKnowledgeCheck(task.conceptName, "review_task");
   };
 
+
+  const conceptSnapshotFromCandidate = (candidate: CandidateConcept): KnowledgeConcept => ({
+    id: candidate.id,
+    name: candidate.canonicalName,
+    canonicalName: candidate.canonicalName,
+    aliases: candidate.aliases,
+    normalizedKey: candidate.normalizedKey,
+    category: sanitizeKnowledgeCategory(candidate.suggestedCategory || classifyConceptFallback(candidate.canonicalName, candidate.aliases)),
+    status: "candidate",
+    confidence: candidate.extractionConfidence,
+    reason: candidate.reason || candidate.summary,
+    cardId: candidate.normalizedKey,
+    createdAt: candidate.createdAt || now()
+  });
+
+  const mergeDocumentConceptSnapshots = (current: KnowledgeConcept[], candidates: CandidateConcept[]) => {
+    const byKey = new Map(current.map((concept) => [concept.normalizedKey || normalizeConceptName(concept.canonicalName || concept.name), concept]));
+    candidates.forEach((candidate) => {
+      byKey.set(candidate.normalizedKey, conceptSnapshotFromCandidate(candidate));
+    });
+    return Array.from(byKey.values());
+  };
+
   const handleParsed = (parsed: ParsedDocument) => {
     setParsedDocument(parsed);
     setConcepts((current) => {
@@ -1216,7 +1303,7 @@ export default function App() {
         id: `concept_init:${canonical.normalizedKey}`,
         conceptName: canonical.canonicalName,
         delta: 0,
-        reason: "上传资料抽取知识点，初始化画像",
+        reason: "\u4e0a\u4f20\u8d44\u6599\u62bd\u53d6\u77e5\u8bc6\u70b9\uff0c\u521d\u59cb\u5316\u753b\u50cf",
         source: "concept_init",
         createdAt: now()
       });
@@ -1224,12 +1311,39 @@ export default function App() {
     setTrace([
       {
         id: `upload_${Date.now()}`,
-        title: "资料解析完成",
+        title: "\u8d44\u6599\u89e3\u6790\u5b8c\u6210",
         type: "document_parse",
         status: parsed.status === "failed" ? "failed" : "success",
-        detail: `${parsed.fileName}: 提取 ${parsed.chunks.length} 个片段，抽取 ${parsed.concepts.length} 个知识点。`
+        detail: `${parsed.fileName}: \u63d0\u53d6 ${parsed.chunks.length} \u4e2a\u7247\u6bb5\uff0c\u62bd\u53d6 ${parsed.concepts.length} \u4e2a\u77e5\u8bc6\u70b9\u3002`
       }
     ]);
+    void extractDocumentConceptsWithLLM({
+      config,
+      documentText: parsed.text,
+      chunks: parsed.chunks,
+      knownConcepts: concepts,
+      pendingCandidates,
+      fileName: parsed.fileName,
+      existingCategories: Array.from(new Set([...concepts.map((concept) => concept.category), ...cards.map((card) => card.category)]))
+    }).then((result) => {
+      if (result.candidates.length > 0) {
+        setPendingCandidates((current) => result.candidates.reduce((next, candidate) => upsertCandidateConcept(next, candidate, concepts), current));
+        setParsedDocument((current) =>
+          current.id === parsed.id
+            ? {
+                ...current,
+                concepts: mergeDocumentConceptSnapshots(current.concepts, result.candidates),
+                updatedAt: now()
+              }
+            : current
+        );
+        ensureTemporaryCardsForCandidates(result.candidates, {
+          source: "manual",
+          sourceText: parsed.text.slice(0, 1800)
+        });
+      }
+      if (result.trace?.length) setTrace((current) => [...normalizeTraceSteps(result.trace ?? []), ...current]);
+    });
   };
 
   const handleSend = async () => {
@@ -1502,12 +1616,23 @@ export default function App() {
     const normalized = canonical.normalizedKey;
     const exists = concepts.some((concept) => (concept.normalizedKey || normalizeConceptName(concept.name)) === normalized);
     const pending = pendingCandidates.find((candidate) => candidate.normalizedKey === normalized);
-    const finalCategory =
-      category && category !== "待确认新概念" && category !== "待分类"
-        ? category
-        : pending?.suggestedCategory && pending.suggestedCategory !== "寰呯‘璁ゆ柊姒傚康"
-          ? pending.suggestedCategory
+    const sanitizedInputCategory = sanitizeKnowledgeCategory(category);
+    const sanitizedPendingCategory = sanitizeKnowledgeCategory(pending?.suggestedCategory);
+    let finalCategory =
+      !isPendingCategoryLabel(sanitizedInputCategory)
+        ? sanitizedInputCategory
+        : !isPendingCategoryLabel(sanitizedPendingCategory)
+          ? sanitizedPendingCategory
           : classifyConceptFallback(canonical.canonicalName, canonical.aliases);
+    if (isPendingCategoryLabel(finalCategory)) {
+      const classified = await classifyConceptForKnowledgeBase({
+        concept: pending ?? { canonicalName: canonical.canonicalName, aliases: canonical.aliases, reason },
+        existingCategories: Array.from(new Set([...concepts.map((concept) => concept.category), ...cards.map((card) => card.category)])),
+        knownConcepts: concepts,
+        llmConfig: config
+      });
+      finalCategory = sanitizeKnowledgeCategory(classified.category || classifyConceptFallback(canonical.canonicalName, canonical.aliases));
+    }
     const fullCard = await ensureKnowledgeCard(canonical.canonicalName, {
       category: finalCategory,
       source,
@@ -1515,7 +1640,7 @@ export default function App() {
       relatedConcept,
       force: isKnowledgeCardIncomplete(findAnyCard(canonical.canonicalName))
     });
-    const cardCategory = fullCard.category && fullCard.category !== "待确认新概念" && fullCard.category !== "待分类" ? fullCard.category : finalCategory;
+    const cardCategory = !isPendingCategoryLabel(fullCard.category) ? sanitizeKnowledgeCategory(fullCard.category) : finalCategory;
     if (!exists) {
       conceptNameSetRef.current.add(normalized);
       const concept: KnowledgeConcept = {
@@ -1714,6 +1839,37 @@ export default function App() {
       );
       setQuizGenerationProgress({ conceptName: targetConceptLabel, activeIndex: 2, sourceLabel: generated.questions[0]?.source ?? "unknown" });
       restartQuiz(generated.questions);
+      const extraConceptCandidates = generated.questions.flatMap((question) =>
+        (question.extraConcepts ?? []).map((concept) => ({
+          name: concept.name,
+          category: concept.category,
+          reason: concept.reason || question.explanationMarkdown,
+          shouldAddToCourse: true,
+          confidence: 0.72,
+          contextRole: "key_prerequisite" as const,
+          candidateType: "concept" as const,
+          educationalValue: 0.72,
+          noiseRisk: 0.26,
+          granularity: "good" as const
+        }))
+      );
+      if (extraConceptCandidates.length > 0) {
+        const extraExtraction = processConceptExtraction({
+          sourceType: "quiz_explanation",
+          rawText: generated.questions.map((question) => question.questionMarkdown).join("\n"),
+          contextText: generated.questions.map((question) => question.explanationMarkdown).join("\n"),
+          knownConcepts: concepts,
+          pendingCandidates,
+          llmCandidates: extraConceptCandidates
+        });
+        if (extraExtraction.acceptedCandidates.length > 0) {
+          setPendingCandidates((current) => extraExtraction.acceptedCandidates.reduce((next, candidate) => upsertCandidateConcept(next, candidate, concepts), current));
+          ensureTemporaryCardsForCandidates(extraExtraction.acceptedCandidates, {
+            source: "quiz_explanation",
+            sourceText: generated.questions.map((question) => question.explanationMarkdown).join("\n\n").slice(0, 1800)
+          });
+        }
+      }
       setQuizGenerationProgress({ conceptName: targetConceptLabel, activeIndex: 3, sourceLabel: generated.questions[0]?.source ?? "unknown" });
       setQuizWarning(generated.warning ?? "");
       setQuizDifficultyHint(resolvedDifficulty.reason);
@@ -1755,7 +1911,7 @@ export default function App() {
     const exists = concepts.some((concept) => (concept.normalizedKey || normalizeConceptName(concept.name)) === canonical.normalizedKey);
     if (currentQuizQuestion && !exists) {
       const extra = currentQuizQuestion.extraConcepts?.find((item) => normalizeConceptName(item.name) === normalizeConceptName(conceptName));
-      addPendingCandidate(
+      const pending = addPendingCandidate(
         {
           name: conceptName,
           category: extra?.category,
@@ -1764,6 +1920,11 @@ export default function App() {
         },
         "quiz_explanation"
       );
+      ensureTemporaryCardsForCandidates([pending], {
+        source: "quiz_explanation",
+        currentQuizQuestion,
+        sourceText: currentQuizQuestion.explanationMarkdown
+      });
     }
     void openCardWithGeneratedFallback(conceptName, {
       source: currentQuizQuestion ? "quiz_explanation" : "manual",

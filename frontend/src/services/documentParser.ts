@@ -59,29 +59,12 @@ export function extractConcepts(text: string): KnowledgeConcept[] {
     if (names.some((name) => text.includes(name))) concepts.set(concept.normalizedKey || concept.name, concept);
   });
 
-  const headingMatches = Array.from(text.matchAll(/^#{1,3}\s+(.+)$/gm)).map((match) => match[1].trim());
-  const quotedMatches = Array.from(text.matchAll(/[\u201c"\u300a《]([^\u201d"\u300b》]{2,18})[\u201d"\u300b》]/g)).map((match) => match[1].trim());
-  const llmCandidates = [...headingMatches, ...quotedMatches]
-    .filter((name) => name && name.length <= 40)
-    .map((name) => ({
-      name,
-      confidence: 0.62,
-      shouldAddToCourse: true,
-      reason: "从上传资料标题或强调文本中抽取",
-      contextRole: "main_topic" as const,
-      candidateType: "concept" as const,
-      educationalValue: 0.62,
-      noiseRisk: 0.32,
-      granularity: "good" as const
-    }));
-
   const extraction = processConceptExtraction({
     sourceType: "document",
     rawText: text,
     contextText: text.slice(0, 6000),
     knownConcepts: initialConcepts,
-    pendingCandidates: [],
-    llmCandidates
+    pendingCandidates: []
   });
 
   extraction.acceptedCandidates.forEach((candidate) => {
@@ -92,7 +75,7 @@ export function extractConcepts(text: string): KnowledgeConcept[] {
         canonicalName: candidate.canonicalName,
         aliases: candidate.aliases,
         normalizedKey: candidate.normalizedKey,
-        category: candidate.suggestedCategory || "待确认新概念",
+        category: candidate.suggestedCategory || "\u5f85\u786e\u8ba4\u65b0\u6982\u5ff5",
         status: "candidate",
         confidence: candidate.extractionConfidence ?? 0.62,
         reason: candidate.reason
@@ -102,21 +85,46 @@ export function extractConcepts(text: string): KnowledgeConcept[] {
 
   return Array.from(concepts.values()).slice(0, 24);
 }
+
 function decodePdfLiteral(value: string) {
-  return value
-    .replace(/\\([()\\])/g, "$1")
-    .replace(/\\n/g, "\n")
-    .replace(/\\r/g, "\n")
-    .replace(/\\t/g, " ")
-    .replace(/\\\d{1,3}/g, " ")
-    .trim();
+  let output = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (char !== "\\") {
+      output += char;
+      continue;
+    }
+    const next = value[index + 1] ?? "";
+    const map: Record<string, string> = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", "(": "(", ")": ")", "\\": "\\" };
+    if (map[next] !== undefined) {
+      output += map[next];
+      index += 1;
+      continue;
+    }
+    const octal = value.slice(index + 1).match(/^[0-7]{1,3}/)?.[0];
+    if (octal) {
+      output += String.fromCharCode(parseInt(octal, 8));
+      index += octal.length;
+      continue;
+    }
+    output += next;
+    index += next ? 1 : 0;
+  }
+  return output;
 }
 
-function decodePdfHex(value: string) {
-  const clean = value.replace(/\s+/g, "");
-  const bytes = clean.match(/.{1,2}/g)?.map((part) => Number.parseInt(part, 16)).filter((item) => Number.isFinite(item)) ?? [];
-  return textDecoder.decode(new Uint8Array(bytes)).trim();
+function decodePdfHex(value = "") {
+  const hex = value.replace(/\s+/g, "");
+  if (!hex) return "";
+  const bytes: number[] = [];
+  for (let index = 0; index < hex.length; index += 2) {
+    const pair = hex.slice(index, index + 2).padEnd(2, "0");
+    const byte = Number.parseInt(pair, 16);
+    if (Number.isFinite(byte)) bytes.push(byte);
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(new Uint8Array(bytes));
 }
+
 
 async function parsePdfFile(file: File): Promise<string> {
   const latin = new TextDecoder("latin1").decode(await file.arrayBuffer());
