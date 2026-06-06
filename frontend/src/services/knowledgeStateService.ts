@@ -1,9 +1,38 @@
 import type { CandidateConcept, ConceptExtractionSource, KnowledgeCard, KnowledgeConcept, MasteryRecord, NewConceptCandidate } from "../types";
-import { canonicalizeConceptName, mergeAliases, normalizeConceptKey } from "./conceptIdentity";
-import { normalizeCard, upsertCards } from "./knowledgeCardService";
+import { canonicalizeConceptName, getTerminologyCategoryHint, mergeAliases, normalizeConceptKey } from "./conceptIdentity";
+import { buildFallbackKnowledgeCard, normalizeCard, upsertCards } from "./knowledgeCardService";
 import { conceptIdFromName, upsertMastery } from "./masteryService";
 
 const now = () => new Date().toISOString();
+
+const pendingCategoryLabels = new Set([
+  "\u5f85\u786e\u8ba4\u65b0\u6982\u5ff5",
+  "\u5f85\u786e\u8ba4",
+  "pending",
+  "pending review",
+  "unknown",
+  "new concept",
+  ""
+]);
+
+export function sanitizeKnowledgeCategory(category?: string | null) {
+  const value = String(category ?? "").trim();
+  if (!value) return "\u5f85\u5206\u7c7b";
+  const normalized = value.toLowerCase();
+  if (
+    pendingCategoryLabels.has(value) ||
+    pendingCategoryLabels.has(normalized) ||
+    value.includes("\u5f85\u786e\u8ba4") ||
+    value.includes("\u65b0\u6982\u5ff5")
+  ) {
+    return "\u5f85\u5206\u7c7b";
+  }
+  return value;
+}
+
+export function isPendingCategoryLabel(category?: string | null) {
+  return sanitizeKnowledgeCategory(category) === "\u5f85\u5206\u7c7b";
+}
 
 type CandidateInput = NewConceptCandidate | {
   name: string;
@@ -33,7 +62,7 @@ export function toCandidateConcept(
     canonicalName: canonical.canonicalName,
     aliases: canonical.aliases,
     normalizedKey: canonical.normalizedKey,
-    suggestedCategory: candidate.category,
+    suggestedCategory: sanitizeKnowledgeCategory(candidate.category),
     summary: candidate.reason,
     reason: candidate.reason,
     source: "source" in candidate && candidate.source ? candidate.source : source,
@@ -94,12 +123,22 @@ export function upsertCandidateConcept(candidates: CandidateConcept[], incoming:
 }
 
 export function classifyConceptFallback(conceptName: string, aliases: string[] = []) {
+  const registryHint = getTerminologyCategoryHint(conceptName) || aliases.map(getTerminologyCategoryHint).find(Boolean);
+  if (registryHint) return registryHint;
   const text = [conceptName, ...aliases].join(" ").toLowerCase();
-  if (/(cnn|rnn|lstm|resnet|transformer|attention|bert|gpt|gan|卷积神经网络|循环神经网络|注意力机制|深度)/i.test(text)) return "深度学习";
-  if (/(gradient|loss|overfit|regularization|svm|pca|梯度|损失函数|过拟合|正则化|机器学习)/i.test(text)) return "机器学习基础";
-  if (/(derivative|chain rule|matrix|probability|导数|链式法则|矩阵|概率|函数|数学)/i.test(text)) return "数学基础";
-  return "待分类";
+  if (/(tcp|\bip\b|dns|http|routing|congestion|computer network|\u8ba1\u7b97\u673a\u7f51\u7edc|\u62e5\u585e\u63a7\u5236|\u8def\u7531)/i.test(text)) return "\u8ba1\u7b97\u673a\u7f51\u7edc";
+  if (/(operating system|process|thread|virtual memory|deadlock|scheduling|file system|\u64cd\u4f5c\u7cfb\u7edf|\u8fdb\u7a0b|\u7ebf\u7a0b|\u865a\u62df\u5185\u5b58|\u6b7b\u9501|\u8c03\u5ea6)/i.test(text)) return "\u64cd\u4f5c\u7cfb\u7edf";
+  if (/(cache|pipeline|bus|address|computer architecture|\u7f13\u5b58|\u6307\u4ee4\u6d41\u6c34\u7ebf|\u603b\u7ebf|\u5730\u5740)/i.test(text)) return "\u8ba1\u7b97\u673a\u7cfb\u7edf";
+  if (/(database|sql|transaction|index|normal form|normalization|\u6570\u636e\u5e93|\u4e8b\u52a1|\u7d22\u5f15|\u8303\u5f0f)/i.test(text)) return "\u6570\u636e\u5e93\u7cfb\u7edf";
+  if (/(lexical|syntax|parsing|compiler|intermediate representation|register allocation|\u8bcd\u6cd5\u5206\u6790|\u8bed\u6cd5\u5206\u6790|\u7f16\u8bd1|\u4e2d\u95f4\u4ee3\u7801|\u5bc4\u5b58\u5668\u5206\u914d)/i.test(text)) return "\u7f16\u8bd1\u539f\u7406";
+  if (/(linked list|tree|graph|sort|dynamic programming|\u94fe\u8868|\u6811|\u56fe|\u6392\u5e8f|\u52a8\u6001\u89c4\u5212)/i.test(text)) return "\u6570\u636e\u7ed3\u6784\u4e0e\u7b97\u6cd5";
+  if (/(mdp|bellman|q-learning|ppo|dqn|reward function|value function|policy function|\u8d1d\u5c14\u66fc|\u9a6c\u5c14\u53ef\u592b|\u5956\u52b1\u51fd\u6570|\u4ef7\u503c\u51fd\u6570|\u7b56\u7565\u51fd\u6570|\u5f3a\u5316\u5b66\u4e60)/i.test(text)) return "\u5f3a\u5316\u5b66\u4e60";
+  if (/(cnn|rnn|lstm|resnet|transformer|attention|bert|gpt|gan|convolutional neural network|\u5377\u79ef\u795e\u7ecf\u7f51\u7edc|\u5faa\u73af\u795e\u7ecf\u7f51\u7edc|\u6ce8\u610f\u529b\u673a\u5236|\u6df1\u5ea6)/i.test(text)) return "\u6df1\u5ea6\u5b66\u4e60";
+  if (/(gradient|loss|overfit|regularization|svm|pca|\u68af\u5ea6|\u635f\u5931\u51fd\u6570|\u8fc7\u62df\u5408|\u6b63\u5219\u5316|\u673a\u5668\u5b66\u4e60)/i.test(text)) return "\u673a\u5668\u5b66\u4e60\u57fa\u7840";
+  if (/(derivative|chain rule|matrix|probability|\u5bfc\u6570|\u94fe\u5f0f\u6cd5\u5219|\u77e9\u9635|\u6982\u7387|\u51fd\u6570|\u6570\u5b66)/i.test(text)) return "\u6570\u5b66\u57fa\u7840";
+  return "\u5f85\u5206\u7c7b";
 }
+
 
 function canonicalizeConcept(concept: KnowledgeConcept, known: KnowledgeConcept[] = []): KnowledgeConcept {
   const canonical = canonicalizeConceptName(concept.canonicalName || concept.name, known);
@@ -111,7 +150,7 @@ function canonicalizeConcept(concept: KnowledgeConcept, known: KnowledgeConcept[
     aliases: mergeAliases(concept.aliases ?? [], canonical.aliases, canonical.canonicalName),
     normalizedKey: canonical.normalizedKey,
     status: "existing",
-    category: concept.category || "待分类",
+    category: sanitizeKnowledgeCategory(concept.category || classifyConceptFallback(canonical.canonicalName, canonical.aliases)),
     cardId: concept.cardId || conceptIdFromName(canonical.canonicalName),
     createdAt: concept.createdAt || now()
   };
@@ -131,12 +170,12 @@ export function reconcileKnowledgeState({
   const conceptByKey = new Map<string, KnowledgeConcept>();
   const migratedCandidates: CandidateConcept[] = [];
   concepts.forEach((concept) => {
-    if (concept.status === "candidate" || concept.category === "待确认新概念") {
+    if (concept.status === "candidate" || isPendingCategoryLabel(concept.category)) {
       migratedCandidates.push(
         toCandidateConcept(
           {
             name: concept.canonicalName || concept.name,
-            category: concept.category === "待确认新概念" ? undefined : concept.category,
+            category: sanitizeKnowledgeCategory(concept.category),
             reason: concept.reason,
             source: "chat"
           },
@@ -153,10 +192,10 @@ export function reconcileKnowledgeState({
       id: previous?.id || canonical.id,
       aliases: mergeAliases(previous?.aliases, canonical.aliases, canonical.canonicalName || canonical.name),
       category:
-        previous?.category && previous.category !== "待分类" && previous.category !== "待确认新概念"
-          ? previous.category
-          : canonical.category && canonical.category !== "待确认新概念"
-            ? canonical.category
+        !isPendingCategoryLabel(previous?.category)
+          ? sanitizeKnowledgeCategory(previous?.category)
+          : !isPendingCategoryLabel(canonical.category)
+            ? sanitizeKnowledgeCategory(canonical.category)
             : classifyConceptFallback(canonical.name, canonical.aliases),
       cardId: previous?.cardId || canonical.cardId,
       createdAt: previous?.createdAt || canonical.createdAt
@@ -198,7 +237,7 @@ export function reconcileKnowledgeState({
       canonicalName: canonical.canonicalName,
       aliases: mergeAliases(candidate.aliases ?? [], canonical.aliases, canonical.canonicalName),
       normalizedKey: canonical.normalizedKey,
-      suggestedCategory: candidate.suggestedCategory === "\u5f85\u786e\u8ba4\u65b0\u6982\u5ff5" ? undefined : candidate.suggestedCategory,
+      suggestedCategory: sanitizeKnowledgeCategory(candidate.suggestedCategory || classifyConceptFallback(canonical.canonicalName, canonical.aliases)),
       status: "pending"
     };
     candidateByKey.set(canonical.normalizedKey, existing ? mergeCandidateConcept(existing, normalizedCandidate) : normalizedCandidate);
@@ -209,5 +248,103 @@ export function reconcileKnowledgeState({
     cards: reconciledCards,
     mastery: reconciledMastery,
     candidates: Array.from(candidateByKey.values())
+  };
+}
+
+
+export function reconcilePendingCandidatesAndTemporaryCards({
+  pendingCandidates,
+  temporaryCards,
+  confirmedConcepts
+}: {
+  pendingCandidates: CandidateConcept[];
+  temporaryCards: KnowledgeCard[];
+  confirmedConcepts: KnowledgeConcept[];
+}): {
+  pendingCandidates: CandidateConcept[];
+  temporaryCards: KnowledgeCard[];
+  missingTemporaryCards: string[];
+  orphanTemporaryCards: string[];
+} {
+  const confirmedKeys = new Set(confirmedConcepts.map((concept) => concept.normalizedKey || normalizeConceptKey(concept.canonicalName || concept.name)));
+  const candidateByKey = new Map<string, CandidateConcept>();
+  pendingCandidates.forEach((candidate) => {
+    const canonical = canonicalizeConceptName(candidate.canonicalName, [...confirmedConcepts, ...Array.from(candidateByKey.values())]);
+    if (confirmedKeys.has(canonical.normalizedKey)) return;
+    const normalized: CandidateConcept = {
+      ...candidate,
+      id: `candidate_${canonical.normalizedKey}`,
+      canonicalName: canonical.canonicalName,
+      aliases: mergeAliases(candidate.aliases ?? [], canonical.aliases, canonical.canonicalName),
+      normalizedKey: canonical.normalizedKey,
+      suggestedCategory: sanitizeKnowledgeCategory(candidate.suggestedCategory || classifyConceptFallback(canonical.canonicalName, canonical.aliases)),
+      status: "pending"
+    };
+    const existing = candidateByKey.get(canonical.normalizedKey);
+    candidateByKey.set(canonical.normalizedKey, existing ? mergeCandidateConcept(existing, normalized) : normalized);
+  });
+
+  const cardByKey = new Map<string, KnowledgeCard>();
+  temporaryCards.forEach((card) => {
+    const canonical = canonicalizeConceptName(card.canonicalName || card.name, [...confirmedConcepts, ...Array.from(candidateByKey.values())]);
+    if (confirmedKeys.has(canonical.normalizedKey)) return;
+    const normalizedCard = normalizeCard(
+      {
+        ...card,
+        name: canonical.canonicalName,
+        canonicalName: canonical.canonicalName,
+        aliases: mergeAliases(card.aliases ?? [], canonical.aliases, canonical.canonicalName),
+        normalizedKey: canonical.normalizedKey,
+        category: sanitizeKnowledgeCategory(card.category || classifyConceptFallback(canonical.canonicalName, canonical.aliases)),
+        status: "temporary"
+      },
+      card.source,
+      confirmedConcepts
+    );
+    cardByKey.set(canonical.normalizedKey, normalizedCard);
+    if (!candidateByKey.has(canonical.normalizedKey)) {
+      candidateByKey.set(canonical.normalizedKey, toCandidateConcept({
+        name: canonical.canonicalName,
+        category: normalizedCard.category,
+        reason: normalizedCard.summary,
+        source: "related_concept",
+        candidateType: "concept",
+        contextRole: "application",
+        educationalValue: 0.68,
+        noiseRisk: 0.3,
+        granularity: "good"
+      }, [...confirmedConcepts, ...Array.from(candidateByKey.values())], "related_concept"));
+    }
+  });
+
+  const missingTemporaryCards: string[] = [];
+  candidateByKey.forEach((candidate) => {
+    if (cardByKey.has(candidate.normalizedKey)) return;
+    missingTemporaryCards.push(candidate.canonicalName);
+    const fallback = buildFallbackKnowledgeCard({
+      conceptName: candidate.canonicalName,
+      category: sanitizeKnowledgeCategory(candidate.suggestedCategory || classifyConceptFallback(candidate.canonicalName, candidate.aliases)),
+      source: "pending candidate fallback temporary card",
+      sourceText: candidate.reason || candidate.summary,
+      knownConcepts: confirmedConcepts
+    });
+    cardByKey.set(candidate.normalizedKey, {
+      ...fallback,
+      name: candidate.canonicalName,
+      canonicalName: candidate.canonicalName,
+      aliases: candidate.aliases,
+      normalizedKey: candidate.normalizedKey,
+      category: sanitizeKnowledgeCategory(candidate.suggestedCategory || fallback.category),
+      status: "temporary"
+    });
+  });
+
+  const candidateKeys = new Set(candidateByKey.keys());
+  const orphanTemporaryCards = Array.from(cardByKey.entries()).filter(([key]) => !candidateKeys.has(key)).map(([, card]) => card.name);
+  return {
+    pendingCandidates: Array.from(candidateByKey.values()),
+    temporaryCards: Array.from(cardByKey.values()),
+    missingTemporaryCards,
+    orphanTemporaryCards
   };
 }

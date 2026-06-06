@@ -8,6 +8,7 @@ import type {
   LLMConfig,
   MasteryRecord,
   NewConceptCandidate,
+  CandidateConcept,
   QuestionType,
   QuizQuestion,
   SourceRef
@@ -17,6 +18,8 @@ import { conceptIdFromName, getMasteryLevel } from "./masteryService";
 import { buildFallbackKnowledgeCard, normalizeCard } from "./knowledgeCardService";
 import type { RetrievalResult } from "./retrievalService";
 import { describeRetrievalResult } from "./retrievalService";
+import { processConceptExtraction } from "./conceptExtractionService";
+import { classifyConceptFallback, isPendingCategoryLabel, sanitizeKnowledgeCategory } from "./knowledgeStateService";
 
 export type StructuredLLMResult = {
   answer: AgentAnswer;
@@ -79,7 +82,7 @@ function buildPrompt(question: string, chunks: CourseChunk[], concepts: Knowledg
   const masteryText = mastery.map((item) => `${item.conceptName}: ${item.score.toFixed(2)} ${getMasteryLevel(item.score)}`).join("\n");
 
   return `You are ZhiJie Agent, an AI learning assistant for university courses.
-When course material chunks are provided, prioritize them. If the chunks do not contain enough evidence, explicitly say "?????????????" before using general knowledge.
+When course material chunks are provided, prioritize them. If the chunks do not contain enough evidence, explicitly say "The provided material is insufficient; I will use general knowledge." before using general knowledge.
 Do not invent citations or claim that the material contains something it does not contain.
 ${contextNotice}
 
@@ -111,9 +114,12 @@ answerMarkdown 字段是给学生看的最终回答：
 - 不要使用 HTML 公式。
 
 Concept extraction rules:
-- detectedConcepts should only include real teachable concepts, methods, models, algorithms, theorems, skills, misconceptions, or applications.
-- Do not list greetings, filler words, task verbs, generic nouns, or broad labels such as math/model/code/knowledge point/course as ordinary concepts.
-- newConceptCandidates should include only course-external but educationally valuable concepts worth pending review.
+- detectedConcepts should include only 1-5 core teachable concepts, methods, models, algorithms, theorems, skills, misconceptions, or applications.
+- newConceptCandidates should include at most 3 course-external concepts worth pending review.
+- Do not list greetings, filler words, task verbs, heading words, step words, generic nouns, or broad labels such as math, physics, model, algorithm, code, knowledge point, course, learning.
+- If the user only greets you, return empty detectedConcepts and empty newConceptCandidates.
+- If the user only says a broad domain such as physics, return empty detectedConcepts and empty newConceptCandidates.
+- Generic terms like state/action/reward/policy/problem/method/process/system/framework/goal/task must be expanded to stable terms or omitted. In reinforcement-learning context use state space/action space/reward function/policy function rather than state/action/reward/policy.
 - If a term is only casually mentioned, do not include it as a new candidate.
 - For each new candidate, estimate contextRole, candidateType, educationalValue, noiseRisk, and granularity.
 
@@ -172,7 +178,7 @@ JSON Schema：
 }`;
 }
 
-function extractJson(text: string): unknown {
+export function extractJson(text: string): unknown {
   const trimmed = text.trim();
   try {
     return JSON.parse(trimmed);
@@ -218,7 +224,7 @@ function normalizeLLMResult(raw: unknown, mode: "llm" | "mock", fallbackSources:
     ? (data.detectedConcepts as Array<Record<string, unknown>>).map(
         (item): DetectedConcept => ({
           name: String(item.name ?? "未知概念"),
-          category: String(item.category ?? "待确认新概念"),
+          category: sanitizeKnowledgeCategory(String(item.category ?? "待分类")),
           status: item.status === "existing" ? "existing" : "candidate",
           masteryScore: typeof item.masteryScore === "number" ? item.masteryScore : undefined,
           reason: typeof item.reason === "string" ? item.reason : ""
@@ -229,7 +235,7 @@ function normalizeLLMResult(raw: unknown, mode: "llm" | "mock", fallbackSources:
     ? (data.newConceptCandidates as Array<Record<string, unknown>>).map(
         (item): NewConceptCandidate => ({
           name: String(item.name ?? "未知新概念"),
-          category: String(item.category ?? "待确认新概念"),
+          category: sanitizeKnowledgeCategory(String(item.category ?? "待分类")),
           confidence: typeof item.confidence === "number" ? item.confidence : 0.5,
           shouldAddToCourse: Boolean(item.shouldAddToCourse),
           reason: String(item.reason ?? ""),
@@ -245,7 +251,7 @@ function normalizeLLMResult(raw: unknown, mode: "llm" | "mock", fallbackSources:
     ? (data.knowledgeCards as Array<Record<string, unknown>>).map((item) =>
         normalizeCard({
           name: String(item.name ?? "未知概念"),
-          category: String(item.category ?? "待确认新概念"),
+          category: sanitizeKnowledgeCategory(String(item.category ?? "待分类")),
           summary: String(item.summary ?? ""),
           intuition: String(item.intuition ?? ""),
           formula: String(item.formula ?? ""),
@@ -287,11 +293,14 @@ function normalizeLLMResult(raw: unknown, mode: "llm" | "mock", fallbackSources:
 }
 
 function fallbackFromPlainText(text: string, sources: SourceRef[]): StructuredLLMResult {
+  if (hasMojibake(text) || text.trim().startsWith("{") || text.includes('"answerMarkdown"')) {
+    return safeStructuredFallbackAnswer(sources, "Model returned non-JSON or corrupted structured content after repair failed.");
+  }
   return {
     answer: {
       mode: "llm",
       taskType: "course_qa",
-      answerMarkdown: `${text}\n\n> 提示：模型本次未返回结构化 JSON，已按普通 Markdown 回答展示。`,
+      answerMarkdown: `${text}\n\n> Note: the model did not return structured JSON, so this answer is displayed as plain Markdown without concept extraction.`,
       concepts: [],
       detectedConcepts: [],
       newConceptCandidates: [],
@@ -301,15 +310,16 @@ function fallbackFromPlainText(text: string, sources: SourceRef[]): StructuredLL
     trace: [
       {
         id: `plain_${Date.now()}`,
-        title: "JSON 解析降级",
+        title: "JSON parse fallback",
         type: "parse_fallback",
         status: "success",
-        detail: "模型未返回合法 JSON，聊天区已展示原始 Markdown 文本。"
+        detail: "Model returned readable Markdown after JSON repair failed; displayed without extracting concepts or cards."
       }
     ],
     cards: []
   };
 }
+
 
 export function buildMockAgentResponse(
   question: string,
@@ -388,7 +398,11 @@ function normalizeRequestModel(config: LLMConfig, model: string) {
   return model;
 }
 
-function buildRequestBody(config: LLMConfig, model: string, messages: Array<{ role: string; content: string }>, maxTokens?: number) {
+function providerSupportsJsonMode(config: LLMConfig) {
+  return ["openai", "deepseek", "dashscope", "zhipu", "openai-compatible"].includes(config.provider);
+}
+
+function buildRequestBody(config: LLMConfig, model: string, messages: Array<{ role: string; content: string }>, maxTokens?: number, jsonMode = false) {
   const body: Record<string, unknown> = {
     model,
     messages,
@@ -396,6 +410,7 @@ function buildRequestBody(config: LLMConfig, model: string, messages: Array<{ ro
   };
 
   if (maxTokens) body.max_tokens = maxTokens;
+  if (jsonMode && providerSupportsJsonMode(config)) body.response_format = { type: "json_object" };
 
   if (isDeepSeekV4(config, model)) {
     // DeepSeek V4 defaults to thinking mode. This Demo needs direct structured JSON,
@@ -435,7 +450,7 @@ function extractErrorMessage(json: unknown): string | null {
   return null;
 }
 
-async function postChatCompletions(config: LLMConfig, messages: Array<{ role: string; content: string }>, maxTokens?: number) {
+async function postChatCompletions(config: LLMConfig, messages: Array<{ role: string; content: string }>, maxTokens?: number, jsonMode = false) {
   const defaults = getProviderDefaults(config.provider);
   const baseUrl = (config.baseUrl || defaults.baseUrl).trim().replace(/\/+$/, "");
   const model = normalizeRequestModel(config, config.model || defaults.model);
@@ -449,7 +464,7 @@ async function postChatCompletions(config: LLMConfig, messages: Array<{ role: st
         "Content-Type": "application/json",
         Authorization: `Bearer ${config.apiKey}`
       },
-      body: JSON.stringify(buildRequestBody(config, model, messages, maxTokens))
+      body: JSON.stringify(buildRequestBody(config, model, messages, maxTokens, jsonMode))
     });
   } catch (error) {
     throw new Error(
@@ -466,6 +481,9 @@ async function postChatCompletions(config: LLMConfig, messages: Array<{ role: st
   }
 
   const errorMessage = extractErrorMessage(json);
+  if (jsonMode && !response.ok && /response_format|json[_ -]?mode|unsupported|not support/i.test(errorMessage ?? rawText)) {
+    return postChatCompletions(config, messages, maxTokens, false);
+  }
   if (!response.ok || errorMessage) {
     throw new Error(formatHttpError(response.status, errorMessage ?? rawText.slice(0, 240)));
   }
@@ -479,6 +497,90 @@ async function postChatCompletions(config: LLMConfig, messages: Array<{ role: st
   }
   if (!content || typeof content !== "string") throw new Error("Model response is empty: missing choices[0].message.content.");
   return content;
+}
+
+const STRUCTURED_JSON_MAX_ATTEMPTS = 2;
+
+const AGENT_JSON_SCHEMA_HINT = `Return one valid JSON object with fields: taskType, detectedConcepts array, newConceptCandidates array, agentTrace array, answerMarkdown string, knowledgeCards array, reviewSuggestions array. Do not use Markdown fences.`;
+const CARD_JSON_SCHEMA_HINT = `Return one valid JSON object with fields: name, category, summary, intuition, formula, example, commonMistakes array, prerequisites array, relatedConcepts array, source. Do not use Markdown fences.`;
+const DOCUMENT_JSON_SCHEMA_HINT = `Return one valid JSON object: {"candidates":[{"surfaceText":"","canonicalName":"","category":"","candidateType":"concept|method|algorithm|model|theorem|skill|misconception|application|unknown","contextRole":"main_topic|explicit_question|key_prerequisite|application|passing_mention|unknown","educationalValue":0.0,"noiseRisk":0.0,"granularity":"good|too_broad|too_narrow|invalid|unknown","confidence":0.0,"reason":"","sourceSnippet":""}]}.`;
+
+function hasMojibake(value: string) {
+  return (
+    /\?{6,}/.test(value) ||
+    value.includes(String.fromCharCode(0xfffd, 0xfffd)) ||
+    value.includes(String.fromCharCode(0xc3)) ||
+    value.includes(String.fromCharCode(0xc2))
+  );
+}
+
+
+function safeStructuredFallbackAnswer(sources: SourceRef[], detail = "JSON parse and repair failed."): StructuredLLMResult {
+  return {
+    answer: {
+      mode: "llm",
+      taskType: "course_qa",
+      answerMarkdown: "The model returned an invalid structured response. Please retry or switch model settings.",
+      concepts: [],
+      detectedConcepts: [],
+      newConceptCandidates: [],
+      sourceRefs: sources,
+      reviewSuggestions: []
+    },
+    trace: [
+      {
+        id: `json_repair_failed_${Date.now()}`,
+        title: "JSON repair failed",
+        type: "parse_fallback",
+        status: "failed",
+        detail
+      }
+    ],
+    cards: []
+  };
+}
+
+async function repairStructuredAgentJson(params: {
+  config: LLMConfig;
+  invalidOutput: string;
+  schemaHint: string;
+  maxTokens?: number;
+}): Promise<unknown> {
+  const prompt = `Your previous output was not valid JSON. Repair the output below into one valid JSON object that matches this schema. Do not add Markdown code fences. Do not explain. Output JSON only.\n\nInvalid output:\n${params.invalidOutput.slice(0, 6000)}\n\nSchema requirements:\n${params.schemaHint}`;
+  const content = await postChatCompletions(
+    params.config,
+    [
+      { role: "system", content: "You repair invalid model output into strict valid JSON only." },
+      { role: "user", content: prompt }
+    ],
+    params.maxTokens ?? 1800,
+    true
+  );
+  return extractJson(content);
+}
+
+async function callStructuredJson(params: {
+  config: LLMConfig;
+  messages: Array<{ role: string; content: string }>;
+  schemaHint: string;
+  maxTokens?: number;
+}): Promise<{ data: unknown; content: string; repaired: boolean }> {
+  let content = await postChatCompletions(params.config, params.messages, params.maxTokens, true);
+  for (let attempt = 1; attempt <= STRUCTURED_JSON_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return { data: extractJson(content), content, repaired: attempt > 1 };
+    } catch (error) {
+      if (attempt >= STRUCTURED_JSON_MAX_ATTEMPTS) throw error;
+      const repaired = await repairStructuredAgentJson({
+        config: params.config,
+        invalidOutput: content,
+        schemaHint: params.schemaHint,
+        maxTokens: params.maxTokens
+      });
+      return { data: repaired, content, repaired: true };
+    }
+  }
+  throw new Error("structured_json_retry_exhausted");
 }
 function sourceLabel(source?: GenerateKnowledgeCardParams["source"]) {
   if (source === "chat") return "由问答中新概念生成";
@@ -630,10 +732,7 @@ export async function callLLMAgent(
           data: contextChunks.map((result) => describeRetrievalResult(result))
         }
       : null;
-    const content = await postChatCompletions(config, [
-      { role: "system", content: "You are a strict learning Agent. Return valid JSON unless the user explicitly asks otherwise." },
-      { role: "user", content: buildPrompt(question, chunks, concepts, mastery, contextChunks) }
-    ]);
+    const prompt = buildPrompt(question, chunks, concepts, mastery, contextChunks);
     const realApiTrace: AgentTraceStep = {
       id: `real_api_${Date.now()}`,
       title: "Real API",
@@ -642,11 +741,22 @@ export async function callLLMAgent(
       detail: `${config.provider} / ${config.model || getProviderDefaults(config.provider).model}`
     };
     try {
-      const result = normalizeLLMResult(extractJson(content), "llm", sourceRefsFromRetrieval(contextChunks, chunks));
-      result.trace = [realApiTrace, ...(materialTrace ? [materialTrace] : []), ...result.trace];
+      const structured = await callStructuredJson({
+        config,
+        messages: [
+          { role: "system", content: "You are a strict learning Agent. Return valid JSON unless the user explicitly asks otherwise." },
+          { role: "user", content: prompt }
+        ],
+        schemaHint: AGENT_JSON_SCHEMA_HINT
+      });
+      const result = normalizeLLMResult(structured.data, "llm", sourceRefsFromRetrieval(contextChunks, chunks));
+      const repairTrace: AgentTraceStep[] = structured.repaired
+        ? [{ id: `json_repair_${Date.now()}`, title: "JSON repair", type: "parse_repair", status: "success", detail: "Invalid structured output was repaired by a second LLM call." }]
+        : [];
+      result.trace = [realApiTrace, ...(materialTrace ? [materialTrace] : []), ...repairTrace, ...result.trace];
       return result;
-    } catch {
-      const result = fallbackFromPlainText(content, sourceRefsFromRetrieval(contextChunks, chunks));
+    } catch (parseError) {
+      const result = safeStructuredFallbackAnswer(sourceRefsFromRetrieval(contextChunks, chunks), parseError instanceof Error ? parseError.message : "JSON repair failed.");
       result.trace = [realApiTrace, ...(materialTrace ? [materialTrace] : []), ...result.trace];
       return result;
     }
@@ -749,11 +859,284 @@ ${masteryText}
 
   const extraInstruction = `如果题目或解析中使用了当前知识库之外的新知识点，请在每道题的 extraConcepts 中列出。只列出真正的学科概念，不要列普通词。`;
 
-  const content = await postChatCompletions(config, [
-    { role: "system", content: "你是诊断测验生成器，只输出合法 JSON。" },
-    { role: "user", content: `${scopeInstruction}\n\n${extraInstruction}\n\n${prompt}` }
-  ]);
-  return extractJson(content);
+  const structured = await callStructuredJson({
+    config,
+    messages: [
+      { role: "system", content: "You are a quiz generator. Return strict valid JSON only." },
+      { role: "user", content: `${scopeInstruction}\n\n${extraInstruction}\n\n${prompt}` }
+    ],
+    schemaHint: `Return one JSON object: {"questions":[{"id":"q1","type":"single_choice|multiple_choice|true_false","difficulty":"basic|medium|advanced","conceptNames":[],"extraConcepts":[],"questionMarkdown":"","options":[{"id":"A","textMarkdown":""}],"answer":"A","explanationMarkdown":""}]}`,
+    maxTokens: 2600
+  });
+  return structured.data;
+}
+
+
+
+type DocumentLLMRawCandidate = {
+  surfaceText?: string;
+  canonicalName?: string;
+  aliases?: string[];
+  category?: string;
+  candidateType?: CandidateConcept["candidateType"];
+  contextRole?: CandidateConcept["contextRole"];
+  educationalValue?: number;
+  noiseRisk?: number;
+  granularity?: CandidateConcept["granularity"];
+  confidence?: number;
+  reason?: string;
+  sourceSnippet?: string;
+};
+
+function isDevEnv() {
+  return (import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV;
+}
+
+function chunkBodyText(chunk: CourseChunk) {
+  return String(chunk.text ?? chunk.content ?? "").trim();
+}
+
+function isMeaningfulDocumentChunk(chunk: CourseChunk) {
+  const text = chunkBodyText(chunk);
+  if (text.length < 120) return false;
+  const section = String(chunk.section ?? "").trim();
+  const head = `${section}\n${text.slice(0, 260)}`.toLowerCase();
+  if (/^(references|bibliography|contents|table of contents|acknowledg|appendix)\b/i.test(section)) return false;
+  if (/(\u76ee\u5f55|\u53c2\u8003\u6587\u732e|\u81f4\u8c22|\u9644\u5f55|\u5b66\u4e60\u76ee\u6807|\u672c\u7ae0\u5c0f\u7ed3|\u8bfe\u540e\u4e60\u9898)/.test(head)) return false;
+  if (/^[\s\d.\u3001\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\-\u2014:?]+$/.test(text.slice(0, 120))) return false;
+  const alphaNumeric = (text.match(/[A-Za-z\u4e00-\u9fa5]/g) ?? []).length;
+  return alphaNumeric >= 80;
+}
+
+function batchChunks<T>(items: T[], size: number) {
+  const batches: T[][] = [];
+  for (let index = 0; index < items.length; index += size) batches.push(items.slice(index, index + size));
+  return batches;
+}
+
+function asRawDocumentCandidates(data: unknown): DocumentLLMRawCandidate[] {
+  const object = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+  const list = Array.isArray(object.candidates) ? object.candidates : [];
+  return list
+    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+    .map((item) => ({
+      surfaceText: typeof item.surfaceText === "string" ? item.surfaceText : undefined,
+      canonicalName: typeof item.canonicalName === "string" ? item.canonicalName : undefined,
+      aliases: asStringArray(item.aliases),
+      category: typeof item.category === "string" ? item.category : undefined,
+      reason: typeof item.reason === "string" ? item.reason : undefined,
+      sourceSnippet: typeof item.sourceSnippet === "string" ? item.sourceSnippet : undefined,
+      confidence: asScore(item.confidence),
+      educationalValue: asScore(item.educationalValue),
+      noiseRisk: asScore(item.noiseRisk),
+      contextRole: asContextRole(item.contextRole),
+      candidateType: asCandidateType(item.candidateType),
+      granularity: asGranularity(item.granularity)
+    }))
+    .filter((item) => String(item.canonicalName || item.surfaceText || "").trim().length > 0);
+}
+
+function buildDocumentExtractionPrompt(params: {
+  fileName: string;
+  batch: CourseChunk[];
+  batchIndex: number;
+  knownConcepts: KnowledgeConcept[];
+  existingCategories: string[];
+}) {
+  const knownText = params.knownConcepts.slice(0, 120).map((concept) => `${concept.canonicalName || concept.name}(${concept.category || "Uncategorized"})`).join(", ");
+  const categoryText = params.existingCategories.length > 0 ? params.existingCategories.join(", ") : "Uncategorized";
+  const contextText = params.batch
+    .map((chunk, index) => `[chunk ${params.batchIndex + index + 1} | ${chunk.section || chunk.source?.section || "body"}]\n${chunkBodyText(chunk).slice(0, 1400)}`)
+    .join("\n\n");
+  return `You are a course knowledge-point extractor for computer science students. Extract only concepts, methods, algorithms, models, protocols, system structures, theorems, skills, or misconceptions that are suitable for knowledge cards.\n\nFile: ${params.fileName}\nKnown concepts: ${knownText || "none"}\nExisting categories: ${categoryText}\n\nRules:\n1. Do not extract catalogs, heading numbers, page numbers, references, introductions, summaries, learning goals, or exercise labels.\n2. Do not extract generic words such as model, system, method, data, process, task, problem, content unless expanded into a precise CS term.\n3. Do not extract over-broad fields such as computer science, math, physics, AI, or machine learning unless the text explicitly defines that learning area.\n4. If an English term has a stable Chinese official translation, return the Chinese canonicalName and put the English term in aliases.\n5. Preserve common abbreviations as canonicalName: CNN, RNN, TCP, IP, DNS, HTTP, BERT, GPT, PPO, DQN, MDP.\n6. Prefer CS meanings: process means process, thread means thread, cache means cache, address means address. In reinforcement learning, expand state/policy/reward into state space/policy function/reward function when appropriate.\n7. Return at most 8 high-quality candidates for this batch, sorted by educational value.\n8. Map category to an existing category when appropriate. If none fit, create a concise stable course category. Never use pending-review status labels as category.\n\nDocument chunks:\n${contextText}\n\nReturn JSON only, no Markdown code fence.\n${DOCUMENT_JSON_SCHEMA_HINT}`;
+}
+
+export async function classifyConceptForKnowledgeBase(params: {
+  concept: CandidateConcept | { canonicalName: string; aliases?: string[]; summary?: string; reason?: string };
+  existingCategories: string[];
+  knownConcepts: KnowledgeConcept[];
+  llmConfig?: LLMConfig;
+}): Promise<{ category: string; isNewCategory: boolean; confidence: number; reason: string }> {
+  const canonicalName = params.concept.canonicalName;
+  const aliases = params.concept.aliases ?? [];
+  const fallbackCategory = sanitizeKnowledgeCategory(classifyConceptFallback(canonicalName, aliases));
+  const config = params.llmConfig;
+  if (!config?.apiKey.trim()) {
+    return { category: fallbackCategory, isNewCategory: !params.existingCategories.includes(fallbackCategory), confidence: 0.55, reason: "Missing API Key; used local category fallback." };
+  }
+
+  try {
+    const structured = await callStructuredJson({
+      config,
+      messages: [
+        { role: "system", content: "You classify course knowledge concepts for CS students. Return strict valid JSON only." },
+        {
+          role: "user",
+          content: `Choose the best course category for a new CS knowledge concept.\n\nExisting categories: ${params.existingCategories.join(", ") || "Uncategorized"}\nKnown concepts: ${params.knownConcepts.slice(0, 80).map((concept) => `${concept.name}(${concept.category})`).join(", ") || "none"}\n\nNew concept: ${canonicalName}\nAliases: ${aliases.join(", ") || "none"}\nContext summary: ${params.concept.summary || params.concept.reason || "none"}\n\nRules:\n1. Prefer an existing category when it fits.\n2. If none fit, create a concise stable course-level category.\n3. Category should usually be 2-8 Chinese characters or a standard CS abbreviation. Do not use vague names like "XXX related knowledge".\n4. Never use a pending-review label as category.\n5. If impossible to judge, return the Chinese category name for Uncategorized.\n\nReturn JSON: {"category":"...","isNewCategory":false,"confidence":0.0,"reason":"..."}`
+        }
+      ],
+      schemaHint: `Return one valid JSON object: {"category":"","isNewCategory":false,"confidence":0.0,"reason":""}.`,
+      maxTokens: 800
+    });
+    const data = structured.data && typeof structured.data === "object" ? (structured.data as Record<string, unknown>) : {};
+    const category = sanitizeKnowledgeCategory(typeof data.category === "string" ? data.category : fallbackCategory);
+    if (isPendingCategoryLabel(category)) return { category: fallbackCategory, isNewCategory: !params.existingCategories.includes(fallbackCategory), confidence: 0.52, reason: "LLM returned pending/empty category; used local category fallback." };
+    return {
+      category,
+      isNewCategory: typeof data.isNewCategory === "boolean" ? data.isNewCategory : !params.existingCategories.includes(category),
+      confidence: asScore(data.confidence) ?? 0.72,
+      reason: typeof data.reason === "string" ? data.reason : "LLM category classification."
+    };
+  } catch (error) {
+    return {
+      category: fallbackCategory,
+      isNewCategory: !params.existingCategories.includes(fallbackCategory),
+      confidence: 0.5,
+      reason: `LLM classification failed; used local category fallback. ${error instanceof Error ? error.message : ""}`
+    };
+  }
+}
+
+export async function extractDocumentConceptsWithLLM(params: {
+  config: LLMConfig;
+  documentText: string;
+  chunks: CourseChunk[];
+  knownConcepts: KnowledgeConcept[];
+  pendingCandidates: CandidateConcept[];
+  fileName: string;
+  existingCategories?: string[];
+}): Promise<{ candidates: CandidateConcept[]; trace?: AgentTraceStep[]; usedLLM: boolean; fallbackReason?: string; rawCandidateCount?: number }> {
+  const existingCategories = Array.from(new Set([...(params.existingCategories ?? []), ...params.knownConcepts.map((concept) => concept.category)].map(sanitizeKnowledgeCategory).filter((item) => !isPendingCategoryLabel(item))));
+  const logDebug = (payload: { usedLLM: boolean; chunkCount: number; rawCandidateCount: number; acceptedCandidates: string[]; fallbackReason?: string }) => {
+    if (isDevEnv()) {
+      console.debug("[document-concept-extraction]", {
+        fileName: params.fileName,
+        ...payload
+      });
+    }
+  };
+  const fallback = (reason: string) => {
+    const extraction = processConceptExtraction({
+      sourceType: "document",
+      rawText: params.documentText,
+      contextText: params.documentText.slice(0, 9000),
+      knownConcepts: params.knownConcepts,
+      pendingCandidates: params.pendingCandidates
+    });
+    const candidates = extraction.acceptedCandidates.map((candidate) => ({
+      ...candidate,
+      suggestedCategory: sanitizeKnowledgeCategory(candidate.suggestedCategory || classifyConceptFallback(candidate.canonicalName, candidate.aliases))
+    }));
+    logDebug({
+      usedLLM: false,
+      chunkCount: params.chunks.length,
+      rawCandidateCount: candidates.length,
+      acceptedCandidates: candidates.map((candidate) => candidate.canonicalName),
+      fallbackReason: reason
+    });
+    return {
+      candidates,
+      usedLLM: false,
+      fallbackReason: reason,
+      rawCandidateCount: candidates.length,
+      trace: [
+        {
+          id: `document_extract_fallback_${Date.now()}`,
+          title: "Document concept fallback",
+          type: "document_extract",
+          status: "success" as const,
+          detail: reason
+        }
+      ]
+    };
+  };
+
+  if (!params.config.apiKey.trim()) return fallback("Missing API Key; used strict local fallback extraction.");
+
+  const meaningfulChunks = params.chunks.filter(isMeaningfulDocumentChunk);
+  const selectedChunks = (meaningfulChunks.length > 0 ? meaningfulChunks : params.chunks).slice(0, 24);
+  const batches = batchChunks(selectedChunks, 3);
+  const rawCandidates: DocumentLLMRawCandidate[] = [];
+  const repairNotes: string[] = [];
+
+  try {
+    for (const [batchIndex, batch] of batches.entries()) {
+      const structured = await callStructuredJson({
+        config: params.config,
+        messages: [
+          { role: "system", content: "You extract document knowledge concepts for CS students. Return strict valid JSON only." },
+          { role: "user", content: buildDocumentExtractionPrompt({ fileName: params.fileName, batch, batchIndex: batchIndex * 3, knownConcepts: params.knownConcepts, existingCategories }) }
+        ],
+        schemaHint: DOCUMENT_JSON_SCHEMA_HINT,
+        maxTokens: 2200
+      });
+      if (structured.repaired) repairNotes.push(`batch ${batchIndex + 1}`);
+      rawCandidates.push(...asRawDocumentCandidates(structured.data));
+    }
+
+    const contextText = selectedChunks.map((chunk) => chunkBodyText(chunk).slice(0, 1400)).join("\n\n");
+    const rankedCandidates = rawCandidates
+      .sort((a, b) => ((b.educationalValue ?? b.confidence ?? 0) - (a.educationalValue ?? a.confidence ?? 0)) || ((a.noiseRisk ?? 0.3) - (b.noiseRisk ?? 0.3)))
+      .slice(0, 50);
+    const extraction = processConceptExtraction({
+      sourceType: "document",
+      rawText: params.documentText,
+      contextText,
+      knownConcepts: params.knownConcepts,
+      pendingCandidates: params.pendingCandidates,
+      llmCandidates: rankedCandidates.map((candidate) => ({
+        name: String(candidate.canonicalName || candidate.surfaceText || ""),
+        category: sanitizeKnowledgeCategory(candidate.category),
+        reason: candidate.reason || candidate.sourceSnippet,
+        confidence: candidate.confidence ?? candidate.educationalValue ?? 0.72,
+        shouldAddToCourse: true,
+        status: "candidate" as const,
+        contextRole: candidate.contextRole ?? "main_topic",
+        candidateType: candidate.candidateType ?? "concept",
+        educationalValue: candidate.educationalValue ?? 0.76,
+        noiseRisk: candidate.noiseRisk ?? 0.22,
+        granularity: candidate.granularity ?? "good"
+      }))
+    });
+
+    const classifiedCandidates = await Promise.all(
+      extraction.acceptedCandidates.slice(0, 50).map(async (candidate) => {
+        if (!isPendingCategoryLabel(candidate.suggestedCategory)) {
+          return { ...candidate, suggestedCategory: sanitizeKnowledgeCategory(candidate.suggestedCategory) };
+        }
+        const classified = await classifyConceptForKnowledgeBase({
+          concept: candidate,
+          existingCategories,
+          knownConcepts: params.knownConcepts,
+          llmConfig: params.config
+        });
+        return { ...candidate, suggestedCategory: sanitizeKnowledgeCategory(classified.category) };
+      })
+    );
+
+    logDebug({
+      usedLLM: true,
+      chunkCount: selectedChunks.length,
+      rawCandidateCount: rawCandidates.length,
+      acceptedCandidates: classifiedCandidates.map((candidate) => candidate.canonicalName)
+    });
+    return {
+      candidates: classifiedCandidates,
+      usedLLM: true,
+      rawCandidateCount: rawCandidates.length,
+      trace: [
+        {
+          id: `document_extract_llm_${Date.now()}`,
+          title: "Document LLM concept extraction",
+          type: "document_extract",
+          status: "success",
+          detail: `Used LLM extraction on ${selectedChunks.length} meaningful chunk(s) in ${batches.length} batch(es); raw ${rawCandidates.length}, accepted ${classifiedCandidates.length}.${repairNotes.length ? ` JSON repair used for ${repairNotes.join(", ")}.` : ""}`
+        }
+      ]
+    };
+  } catch (error) {
+    return fallback(`LLM document extraction failed; used strict local fallback. ${error instanceof Error ? error.message : ""}`);
+  }
 }
 
 export async function testLLMConnection(config: LLMConfig): Promise<string> {
