@@ -46,6 +46,33 @@ function normalizeConceptName(name: string) {
   return name.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
+function MaterialContextStatus({
+  documentTitle,
+  chunkCount,
+  lastContextCount,
+  usedFallbackContext
+}: {
+  documentTitle?: string;
+  chunkCount: number;
+  lastContextCount: number;
+  usedFallbackContext: boolean;
+}) {
+  return (
+    <div className="context-status-card">
+      <div className="context-status-main">
+        <span className={chunkCount > 0 ? "context-badge ready" : "context-badge"}>{chunkCount > 0 ? "资料已加载" : "未加载资料"}</span>
+        {chunkCount > 0 && <span className="context-badge">上下文已启用</span>}
+        <span className="context-detail">
+          {chunkCount > 0
+            ? `${documentTitle ?? "当前资料"} · ${chunkCount} 个片段 · 本次回答使用 ${lastContextCount} 个片段${usedFallbackContext ? " · 已启用弱匹配兜底" : ""}`
+            : "上传资料后，AI Agent 可以结合课程内容回答问题。"}
+        </span>
+      </div>
+      {chunkCount > 0 && <small>当前为简化检索：关键词匹配 + 片段注入，暂未接入向量数据库。</small>}
+    </div>
+  );
+}
+
 export function ChatWindow({
   messages,
   input,
@@ -85,15 +112,7 @@ export function ChatWindow({
         </span>
       </div>
       {lastModelError && <div className="settings-message">Last API error: {lastModelError}</div>}
-      <div className="context-status-card">
-        <strong>{chunkCount > 0 ? "Material context enabled" : "Normal LLM chat"}</strong>
-        <span>
-          {chunkCount > 0
-            ? `${documentTitle ?? "Current material"} · ${chunkCount} chunks · last answer used ${lastContextCount} chunk(s)${usedFallbackContext ? " · weak fallback chunks" : ""}`
-            : "No uploaded material chunks are available for prompt injection."}
-        </span>
-        <small>Simplified retrieval: keyword matching + chunk injection, no embeddings or vector database.</small>
-      </div>
+      <MaterialContextStatus documentTitle={documentTitle} chunkCount={chunkCount} lastContextCount={lastContextCount} usedFallbackContext={usedFallbackContext} />
 
       <div className="message-list">
         {messages.map((message) => (
