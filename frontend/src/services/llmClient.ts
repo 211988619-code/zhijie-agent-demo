@@ -19,7 +19,7 @@ import { buildFallbackKnowledgeCard, normalizeCard } from "./knowledgeCardServic
 import type { RetrievalResult } from "./retrievalService";
 import { describeRetrievalResult } from "./retrievalService";
 import { processConceptExtraction } from "./conceptExtractionService";
-import { classifyConceptFallback, isPendingCategoryLabel, sanitizeKnowledgeCategory } from "./knowledgeStateService";
+import { classifyConceptFallback, classifyConceptFinalFallback, ensureFinalKnowledgeCategory, isInvalidFinalCategory, isPendingCategoryLabel, sanitizeKnowledgeCategory } from "./knowledgeStateService";
 
 export type StructuredLLMResult = {
   answer: AgentAnswer;
@@ -959,7 +959,7 @@ export async function classifyConceptForKnowledgeBase(params: {
 }): Promise<{ category: string; isNewCategory: boolean; confidence: number; reason: string }> {
   const canonicalName = params.concept.canonicalName;
   const aliases = params.concept.aliases ?? [];
-  const fallbackCategory = sanitizeKnowledgeCategory(classifyConceptFallback(canonicalName, aliases));
+  const fallbackCategory = classifyConceptFinalFallback(canonicalName, aliases);
   const config = params.llmConfig;
   if (!config?.apiKey.trim()) {
     return { category: fallbackCategory, isNewCategory: !params.existingCategories.includes(fallbackCategory), confidence: 0.55, reason: "Missing API Key; used local category fallback." };
@@ -972,15 +972,15 @@ export async function classifyConceptForKnowledgeBase(params: {
         { role: "system", content: "You classify course knowledge concepts for CS students. Return strict valid JSON only." },
         {
           role: "user",
-          content: `Choose the best course category for a new CS knowledge concept.\n\nExisting categories: ${params.existingCategories.join(", ") || "Uncategorized"}\nKnown concepts: ${params.knownConcepts.slice(0, 80).map((concept) => `${concept.name}(${concept.category})`).join(", ") || "none"}\n\nNew concept: ${canonicalName}\nAliases: ${aliases.join(", ") || "none"}\nContext summary: ${params.concept.summary || params.concept.reason || "none"}\n\nRules:\n1. Prefer an existing category when it fits.\n2. If none fit, create a concise stable course-level category.\n3. Category should usually be 2-8 Chinese characters or a standard CS abbreviation. Do not use vague names like "XXX related knowledge".\n4. Never use a pending-review label as category.\n5. If impossible to judge, return the Chinese category name for Uncategorized.\n\nReturn JSON: {"category":"...","isNewCategory":false,"confidence":0.0,"reason":"..."}`
+          content: `Choose the best course category for a new CS knowledge concept.\n\nExisting categories: ${params.existingCategories.join(", ") || "Uncategorized"}\nKnown concepts: ${params.knownConcepts.slice(0, 80).map((concept) => `${concept.name}(${concept.category})`).join(", ") || "none"}\n\nNew concept: ${canonicalName}\nAliases: ${aliases.join(", ") || "none"}\nContext summary: ${params.concept.summary || params.concept.reason || "none"}\n\nRules:\n1. Prefer an existing category when it fits.\n2. If none fit, create a concise stable course-level category.\n3. Category should usually be 2-8 Chinese characters or a standard CS abbreviation. Do not use vague names like "XXX related knowledge".\n4. Never use a pending-review label as category.\n5. If impossible to judge, return a safe CS course category such as CS Fundamentals or General Professional Fundamentals; never return Uncategorized or pending categories.\n\nReturn JSON: {"category":"...","isNewCategory":false,"confidence":0.0,"reason":"..."}`
         }
       ],
       schemaHint: `Return one valid JSON object: {"category":"","isNewCategory":false,"confidence":0.0,"reason":""}.`,
       maxTokens: 800
     });
     const data = structured.data && typeof structured.data === "object" ? (structured.data as Record<string, unknown>) : {};
-    const category = sanitizeKnowledgeCategory(typeof data.category === "string" ? data.category : fallbackCategory);
-    if (isPendingCategoryLabel(category)) return { category: fallbackCategory, isNewCategory: !params.existingCategories.includes(fallbackCategory), confidence: 0.52, reason: "LLM returned pending/empty category; used local category fallback." };
+    const category = ensureFinalKnowledgeCategory(typeof data.category === "string" ? data.category : fallbackCategory, fallbackCategory);
+    if (isInvalidFinalCategory(category)) return { category: fallbackCategory, isNewCategory: !params.existingCategories.includes(fallbackCategory), confidence: 0.52, reason: "LLM returned invalid category; used local category fallback." };
     return {
       category,
       isNewCategory: typeof data.isNewCategory === "boolean" ? data.isNewCategory : !params.existingCategories.includes(category),
@@ -1005,8 +1005,9 @@ export async function extractDocumentConceptsWithLLM(params: {
   pendingCandidates: CandidateConcept[];
   fileName: string;
   existingCategories?: string[];
+  onProgress?: (state: { progress: number; message: string; batchIndex?: number; batchCount?: number }) => void;
 }): Promise<{ candidates: CandidateConcept[]; trace?: AgentTraceStep[]; usedLLM: boolean; fallbackReason?: string; rawCandidateCount?: number }> {
-  const existingCategories = Array.from(new Set([...(params.existingCategories ?? []), ...params.knownConcepts.map((concept) => concept.category)].map(sanitizeKnowledgeCategory).filter((item) => !isPendingCategoryLabel(item))));
+  const existingCategories = Array.from(new Set([...(params.existingCategories ?? []), ...params.knownConcepts.map((concept) => concept.category)].map(sanitizeKnowledgeCategory).filter((item) => !isInvalidFinalCategory(item))));
   const logDebug = (payload: { usedLLM: boolean; chunkCount: number; rawCandidateCount: number; acceptedCandidates: string[]; fallbackReason?: string }) => {
     if (isDevEnv()) {
       console.debug("[document-concept-extraction]", {
@@ -1016,6 +1017,7 @@ export async function extractDocumentConceptsWithLLM(params: {
     }
   };
   const fallback = (reason: string) => {
+    params.onProgress?.({ progress: 86, message: "LLM unavailable; using strict local fallback extraction..." });
     const extraction = processConceptExtraction({
       sourceType: "document",
       rawText: params.documentText,
@@ -1025,7 +1027,7 @@ export async function extractDocumentConceptsWithLLM(params: {
     });
     const candidates = extraction.acceptedCandidates.map((candidate) => ({
       ...candidate,
-      suggestedCategory: sanitizeKnowledgeCategory(candidate.suggestedCategory || classifyConceptFallback(candidate.canonicalName, candidate.aliases))
+      suggestedCategory: ensureFinalKnowledgeCategory(candidate.suggestedCategory || classifyConceptFallback(candidate.canonicalName, candidate.aliases), classifyConceptFinalFallback(candidate.canonicalName, candidate.aliases))
     }));
     logDebug({
       usedLLM: false,
@@ -1061,6 +1063,12 @@ export async function extractDocumentConceptsWithLLM(params: {
 
   try {
     for (const [batchIndex, batch] of batches.entries()) {
+      params.onProgress?.({
+        progress: 65 + Math.round((batchIndex / Math.max(1, batches.length)) * 18),
+        message: `Extracting document concepts batch ${batchIndex + 1}/${batches.length}...`,
+        batchIndex,
+        batchCount: batches.length
+      });
       const structured = await callStructuredJson({
         config: params.config,
         messages: [
@@ -1074,6 +1082,7 @@ export async function extractDocumentConceptsWithLLM(params: {
       rawCandidates.push(...asRawDocumentCandidates(structured.data));
     }
 
+    params.onProgress?.({ progress: 84, message: "Normalizing and deduplicating knowledge points..." });
     const contextText = selectedChunks.map((chunk) => chunkBodyText(chunk).slice(0, 1400)).join("\n\n");
     const rankedCandidates = rawCandidates
       .sort((a, b) => ((b.educationalValue ?? b.confidence ?? 0) - (a.educationalValue ?? a.confidence ?? 0)) || ((a.noiseRisk ?? 0.3) - (b.noiseRisk ?? 0.3)))
@@ -1099,10 +1108,11 @@ export async function extractDocumentConceptsWithLLM(params: {
       }))
     });
 
+    params.onProgress?.({ progress: 88, message: "Classifying knowledge points..." });
     const classifiedCandidates = await Promise.all(
       extraction.acceptedCandidates.slice(0, 50).map(async (candidate) => {
-        if (!isPendingCategoryLabel(candidate.suggestedCategory)) {
-          return { ...candidate, suggestedCategory: sanitizeKnowledgeCategory(candidate.suggestedCategory) };
+        if (!isInvalidFinalCategory(candidate.suggestedCategory)) {
+          return { ...candidate, suggestedCategory: ensureFinalKnowledgeCategory(candidate.suggestedCategory, classifyConceptFinalFallback(candidate.canonicalName, candidate.aliases)) };
         }
         const classified = await classifyConceptForKnowledgeBase({
           concept: candidate,
@@ -1110,7 +1120,7 @@ export async function extractDocumentConceptsWithLLM(params: {
           knownConcepts: params.knownConcepts,
           llmConfig: params.config
         });
-        return { ...candidate, suggestedCategory: sanitizeKnowledgeCategory(classified.category) };
+        return { ...candidate, suggestedCategory: ensureFinalKnowledgeCategory(classified.category, classifyConceptFinalFallback(candidate.canonicalName, candidate.aliases)) };
       })
     );
 

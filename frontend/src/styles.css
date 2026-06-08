@@ -3904,6 +3904,56 @@ option {
   font-size: 13px;
 }
 
+.materials-list.grouped {
+  gap: 10px;
+}
+
+.materials-category-group {
+  display: grid;
+  gap: 8px;
+}
+
+.materials-category-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.16s ease, background-color 0.16s ease, transform 0.16s ease;
+}
+
+.materials-category-header:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--primary) 24%, var(--border));
+  background: color-mix(in srgb, var(--panel-soft) 72%, var(--panel));
+}
+
+.materials-category-header span:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.materials-category-header strong {
+  font-size: 14px;
+  font-weight: 750;
+}
+
+.materials-category-header small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.workspace-candidates {
+  margin-top: 0;
+}
+
 .secondary-button.danger {
   border-color: color-mix(in srgb, #b95245 32%, var(--border));
   background: color-mix(in srgb, #fff7f6 58%, var(--panel));

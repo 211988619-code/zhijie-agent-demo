@@ -44,11 +44,12 @@ import type {
   QuizResultChange,
   ReviewTask,
   SpaceConcept,
-  ThemeMode
+  ThemeMode,
+  UploadState
 } from "./types";
 import { canonicalizeConceptName } from "./services/conceptIdentity";
 import { processConceptExtraction } from "./services/conceptExtractionService";
-import { classifyConceptFallback, isPendingCategoryLabel, reconcileKnowledgeState, reconcilePendingCandidatesAndTemporaryCards, sanitizeKnowledgeCategory, toCandidateConcept, upsertCandidateConcept } from "./services/knowledgeStateService";
+import { classifyConceptFallback, classifyConceptFinalFallback, ensureFinalKnowledgeCategory, isInvalidFinalCategory, isPendingCategoryLabel, reconcileKnowledgeState, reconcilePendingCandidatesAndTemporaryCards, sanitizeKnowledgeCategory, toCandidateConcept, upsertCandidateConcept } from "./services/knowledgeStateService";
 import { retrieveRelevantChunks, type RetrievalResult } from "./services/retrievalService";
 
 type RightPanelMode = "trace" | "mistakes" | "review" | "modelConfig";
@@ -323,6 +324,7 @@ export default function App() {
     readLocal("feedbackEvents", {})
   );
   const [dismissedCandidateNames, setDismissedCandidateNames] = useState<string[]>(() => readLocal("dismissedCandidateNames", []));
+  const [recentExtractedCandidateKeys, setRecentExtractedCandidateKeys] = useState<string[]>([]);
   const [candidateMasteryPicker, setCandidateMasteryPicker] = useState<string | null>(null);
   const [candidateInitialScores, setCandidateInitialScores] = useState<Record<string, number>>({});
   const [rightPanelMode, setRightPanelMode] = useState<RightPanelMode>("trace");
@@ -510,6 +512,14 @@ export default function App() {
   const candidateConcepts = pendingCandidates
     .filter((candidate) => !dismissedCandidateNames.includes(candidate.normalizedKey))
     .filter((candidate) => !concepts.some((concept) => (concept.normalizedKey || normalizeConceptName(concept.name)) === candidate.normalizedKey));
+  const displayedCandidateConcepts = useMemo(() => {
+    const byKey = new Map(candidateConcepts.map((candidate) => [candidate.normalizedKey, candidate]));
+    const recent = recentExtractedCandidateKeys.map((key) => byKey.get(key)).filter((candidate): candidate is CandidateConcept => Boolean(candidate));
+    const recentKeys = new Set(recent.map((candidate) => candidate.normalizedKey));
+    return [...recent, ...candidateConcepts.filter((candidate) => !recentKeys.has(candidate.normalizedKey))];
+  }, [candidateConcepts, recentExtractedCandidateKeys]);
+  const visibleCandidateConcepts = displayedCandidateConcepts.slice(0, 8);
+  const hiddenCandidateConceptCount = Math.max(0, displayedCandidateConcepts.length - visibleCandidateConcepts.length);
 
   const activeLearningSpace = learningSpaces.find((space) => space.id === activeLearningSpaceId) ?? learningSpaces[0];
   const activeSession = agentSessions.find((session) => session.id === activeSessionId) ?? agentSessions.find((session) => session.spaceId === activeLearningSpace?.id);
@@ -576,7 +586,29 @@ export default function App() {
     return pending;
   };
 
-  const addAgentExtractedCandidates = (rawText: string, answerMarkdown: string, answer: { detectedConcepts: { name: string; category: string; status: "existing" | "candidate"; reason?: string }[]; newConceptCandidates: { name: string; category: string; reason: string; confidence: number; shouldAddToCourse: boolean; contextRole?: CandidateConcept["contextRole"]; candidateType?: CandidateConcept["candidateType"]; educationalValue?: number; noiseRisk?: number; granularity?: CandidateConcept["granularity"] }[] }) => {
+  const classifyCandidatesForPending = async (candidates: CandidateConcept[]) => {
+    const existingCategories = Array.from(new Set([...concepts.map((concept) => concept.category), ...cards.map((card) => card.category)]));
+    return Promise.all(
+      candidates.map(async (candidate) => {
+        const fallbackCategory = classifyConceptFinalFallback(candidate.canonicalName, candidate.aliases);
+        if (!isInvalidFinalCategory(candidate.suggestedCategory)) {
+          return { ...candidate, suggestedCategory: ensureFinalKnowledgeCategory(candidate.suggestedCategory, fallbackCategory) };
+        }
+        const classified = await classifyConceptForKnowledgeBase({
+          concept: candidate,
+          existingCategories,
+          knownConcepts: concepts,
+          llmConfig: config
+        });
+        return {
+          ...candidate,
+          suggestedCategory: ensureFinalKnowledgeCategory(classified.category, fallbackCategory)
+        };
+      })
+    );
+  };
+
+  const addAgentExtractedCandidates = async (rawText: string, answerMarkdown: string, answer: { detectedConcepts: { name: string; category: string; status: "existing" | "candidate"; reason?: string }[]; newConceptCandidates: { name: string; category: string; reason: string; confidence: number; shouldAddToCourse: boolean; contextRole?: CandidateConcept["contextRole"]; candidateType?: CandidateConcept["candidateType"]; educationalValue?: number; noiseRisk?: number; granularity?: CandidateConcept["granularity"] }[] }) => {
     const extraction = processConceptExtraction({
       sourceType: "chat",
       rawText,
@@ -612,13 +644,18 @@ export default function App() {
       ]
     });
     if (extraction.acceptedCandidates.length > 0) {
-      setPendingCandidates((current) => extraction.acceptedCandidates.reduce((next, candidate) => upsertCandidateConcept(next, candidate, concepts), current));
-      ensureTemporaryCardsForCandidates(extraction.acceptedCandidates, {
+      const classifiedCandidates = await classifyCandidatesForPending(extraction.acceptedCandidates);
+      setRecentExtractedCandidateKeys(classifiedCandidates.map((candidate) => candidate.normalizedKey));
+      setPendingCandidates((current) => classifiedCandidates.reduce((next, candidate) => upsertCandidateConcept(next, candidate, concepts), current));
+      await ensureTemporaryCardsForCandidates(classifiedCandidates, {
         source: "chat",
         userQuestion: rawText,
-        currentAnswerMarkdown: answerMarkdown
+        currentAnswerMarkdown: answerMarkdown,
+        limit: Math.max(4, classifiedCandidates.length)
       });
+      return { ...extraction, acceptedCandidates: classifiedCandidates };
     }
+    setRecentExtractedCandidateKeys([]);
     return extraction;
   };
 
@@ -1008,7 +1045,7 @@ export default function App() {
     return withRelated;
   };
 
-  const ensureTemporaryCardsForCandidates = (
+  const ensureTemporaryCardsForCandidates = async (
     candidates: CandidateConcept[],
     options: {
       source?: "chat" | "quiz" | "quiz_explanation" | "related_concept" | "prerequisite" | "manual";
@@ -1016,6 +1053,7 @@ export default function App() {
       userQuestion?: string;
       currentAnswerMarkdown?: string;
       currentQuizQuestion?: QuizQuestion;
+      limit?: number;
     } = {}
   ) => {
     const confirmedKeys = new Set(concepts.map((concept) => concept.normalizedKey || normalizeConceptName(concept.name)));
@@ -1023,9 +1061,9 @@ export default function App() {
     const targets = candidates
       .filter((candidate) => !confirmedKeys.has(candidate.normalizedKey) && !cardKeys.has(candidate.normalizedKey))
       .sort((a, b) => (b.educationalValue ?? 0) - (a.educationalValue ?? 0))
-      .slice(0, 4);
+      .slice(0, options.limit ?? 4);
     if (targets.length === 0) return;
-    void Promise.allSettled(
+    await Promise.allSettled(
       targets.map((candidate) =>
         ensureKnowledgeCard(candidate.canonicalName, {
           category: candidate.suggestedCategory,
@@ -1261,7 +1299,7 @@ export default function App() {
     canonicalName: candidate.canonicalName,
     aliases: candidate.aliases,
     normalizedKey: candidate.normalizedKey,
-    category: sanitizeKnowledgeCategory(candidate.suggestedCategory || classifyConceptFallback(candidate.canonicalName, candidate.aliases)),
+    category: ensureFinalKnowledgeCategory(candidate.suggestedCategory || classifyConceptFallback(candidate.canonicalName, candidate.aliases), classifyConceptFinalFallback(candidate.canonicalName, candidate.aliases)),
     status: "candidate",
     confidence: candidate.extractionConfidence,
     reason: candidate.reason || candidate.summary,
@@ -1277,73 +1315,67 @@ export default function App() {
     return Array.from(byKey.values());
   };
 
-  const handleParsed = (parsed: ParsedDocument) => {
-    setParsedDocument(parsed);
-    setConcepts((current) => {
-      const byName = new Map(current.map((concept) => [concept.normalizedKey || normalizeConceptName(concept.name), concept]));
-      parsed.concepts.forEach((concept) => {
-        const canonical = canonicalizeConceptName(concept.name, Array.from(byName.values()));
-        byName.set(canonical.normalizedKey, {
-          ...concept,
-          id: conceptIdFromName(canonical.canonicalName),
-          name: canonical.canonicalName,
-          canonicalName: canonical.canonicalName,
-          aliases: canonical.aliases,
-          normalizedKey: canonical.normalizedKey,
-          status: "existing",
-          cardId: conceptIdFromName(canonical.canonicalName),
-          createdAt: concept.createdAt || now()
-        });
+  const handleParsed = async (parsed: ParsedDocument, reportProgress?: (state: UploadState) => void) => {
+    reportProgress?.({ progress: 60, status: "parsing", message: "Calling LLM to extract knowledge points..." });
+    try {
+      const extraction = await extractDocumentConceptsWithLLM({
+        config,
+        documentText: parsed.text,
+        chunks: parsed.chunks,
+        knownConcepts: concepts,
+        pendingCandidates,
+        fileName: parsed.fileName,
+        existingCategories: Array.from(new Set([...concepts.map((concept) => concept.category), ...cards.map((card) => card.category)])),
+        onProgress: (state) => reportProgress?.({ progress: state.progress, status: "parsing", message: state.message })
       });
-      return Array.from(byName.values());
-    });
-    parsed.concepts.forEach((concept) => {
-      const canonical = canonicalizeConceptName(concept.name, concepts);
-      applyMasteryEvent({
-        id: `concept_init:${canonical.normalizedKey}`,
-        conceptName: canonical.canonicalName,
-        delta: 0,
-        reason: "\u4e0a\u4f20\u8d44\u6599\u62bd\u53d6\u77e5\u8bc6\u70b9\uff0c\u521d\u59cb\u5316\u753b\u50cf",
-        source: "concept_init",
-        createdAt: now()
+
+      const finalizedCandidates = extraction.candidates.map((candidate) => ({
+        ...candidate,
+        suggestedCategory: ensureFinalKnowledgeCategory(
+          candidate.suggestedCategory,
+          classifyConceptFinalFallback(candidate.canonicalName, candidate.aliases)
+        )
+      }));
+
+      reportProgress?.({ progress: 94, status: "parsing", message: "Generating temporary knowledge cards..." });
+      await ensureTemporaryCardsForCandidates(finalizedCandidates, {
+        source: "manual",
+        sourceText: parsed.text.slice(0, 1800),
+        limit: Math.max(4, finalizedCandidates.length)
       });
-    });
-    setTrace([
-      {
-        id: `upload_${Date.now()}`,
-        title: "\u8d44\u6599\u89e3\u6790\u5b8c\u6210",
-        type: "document_parse",
-        status: parsed.status === "failed" ? "failed" : "success",
-        detail: `${parsed.fileName}: \u63d0\u53d6 ${parsed.chunks.length} \u4e2a\u7247\u6bb5\uff0c\u62bd\u53d6 ${parsed.concepts.length} \u4e2a\u77e5\u8bc6\u70b9\u3002`
+
+      const finalDocument: ParsedDocument = {
+        ...parsed,
+        status: extraction.usedLLM ? "ready" : "partial",
+        concepts: mergeDocumentConceptSnapshots([], finalizedCandidates),
+        updatedAt: now()
+      };
+
+      setParsedDocument(finalDocument);
+      if (finalizedCandidates.length > 0) {
+        setPendingCandidates((current) => finalizedCandidates.reduce((next, candidate) => upsertCandidateConcept(next, candidate, concepts), current));
       }
-    ]);
-    void extractDocumentConceptsWithLLM({
-      config,
-      documentText: parsed.text,
-      chunks: parsed.chunks,
-      knownConcepts: concepts,
-      pendingCandidates,
-      fileName: parsed.fileName,
-      existingCategories: Array.from(new Set([...concepts.map((concept) => concept.category), ...cards.map((card) => card.category)]))
-    }).then((result) => {
-      if (result.candidates.length > 0) {
-        setPendingCandidates((current) => result.candidates.reduce((next, candidate) => upsertCandidateConcept(next, candidate, concepts), current));
-        setParsedDocument((current) =>
-          current.id === parsed.id
-            ? {
-                ...current,
-                concepts: mergeDocumentConceptSnapshots(current.concepts, result.candidates),
-                updatedAt: now()
-              }
-            : current
-        );
-        ensureTemporaryCardsForCandidates(result.candidates, {
-          source: "manual",
-          sourceText: parsed.text.slice(0, 1800)
-        });
-      }
-      if (result.trace?.length) setTrace((current) => [...normalizeTraceSteps(result.trace ?? []), ...current]);
-    });
+      setTrace([
+        ...normalizeTraceSteps(extraction.trace ?? []),
+        {
+          id: `upload_${Date.now()}`,
+          title: "Document parsing completed",
+          type: "document_parse",
+          status: "success",
+          detail: `${parsed.fileName}: generated ${parsed.chunks.length} chunk(s), extracted ${finalizedCandidates.length} candidate concept(s). ${extraction.usedLLM ? "Used LLM." : `Used local fallback: ${extraction.fallbackReason ?? "model unavailable"}`}`
+        }
+      ]);
+      reportProgress?.({
+        progress: 100,
+        status: extraction.usedLLM ? "ready" : "partial",
+        message: extraction.usedLLM
+          ? `Parsing completed: generated ${parsed.chunks.length} chunk(s), extracted ${finalizedCandidates.length} knowledge point(s).`
+          : `Model unavailable; strict local fallback generated ${parsed.chunks.length} chunk(s), extracted ${finalizedCandidates.length} knowledge point(s).`
+      });
+    } catch (error) {
+      reportProgress?.({ progress: 100, status: "failed", message: error instanceof Error ? error.message : "Document parsing failed" });
+      throw error;
+    }
   };
 
   const handleSend = async () => {
@@ -1378,14 +1410,16 @@ export default function App() {
       } else {
         setModelStatus(config.useMockFallback ? "mock" : "missing-key");
       }
-      addAgentExtractedCandidates(question, result.answer.answerMarkdown, result.answer);
+      void addAgentExtractedCandidates(question, result.answer.answerMarkdown, result.answer).catch((error) => {
+        if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) console.debug("[chat-candidate-classification]", error);
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Model call failed";
       setModelStatus("error");
       setLastModelError(message);
       setMessages((current) => [
         ...current,
-        { id: `agent_error_${Date.now()}`, role: "agent", error: message }
+          { id: `agent_error_${Date.now()}`, role: "agent", error: error instanceof Error ? error.message : "模型调用失败" }
       ]);
     } finally {
       if (activePageRef.current !== "workbench") {
@@ -1547,13 +1581,15 @@ export default function App() {
           )
         );
       }
-      addAgentExtractedCandidates(question, result.answer.answerMarkdown, result.answer);
+      void addAgentExtractedCandidates(question, result.answer.answerMarkdown, result.answer).catch((error) => {
+        if ((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV) console.debug("[chat-candidate-classification]", error);
+      });
     } catch (error) {
       setSessionMessages((current) => ({
         ...current,
         [sessionId]: [
           ...(current[sessionId] ?? []),
-          { id: `agent_error_${Date.now()}`, role: "agent", error: error instanceof Error ? error.message : "妯″瀷璋冪敤澶辫触" }
+          { id: `agent_error_${Date.now()}`, role: "agent", error: error instanceof Error ? error.message : "模型调用失败" }
         ]
       }));
       const userIsViewingSession = activePageRef.current === "learningSpace" && activeSessionIdRef.current === sessionId;
@@ -1684,6 +1720,88 @@ export default function App() {
     setCandidateMasteryPicker(null);
     showToast(exists ? "该知识点已在课程知识库中，已合并别名和卡片" : "已加入课程知识库");
     return !exists;
+  };
+
+  const renderCandidatePanel = (variant: "workspace" | "space" = "workspace") => {
+    if (displayedCandidateConcepts.length === 0) return null;
+    return (
+      <section className={`panel space-candidates ${variant === "workspace" ? "workspace-candidates" : ""}`}>
+        <div className="panel-header compact">
+          <div>
+            <p className="eyebrow">候选知识点</p>
+            <h2>本轮对话识别到的新知识点</h2>
+            <span>优先展示最近回答抽取出的候选，确认后会进入课程知识库。</span>
+          </div>
+        </div>
+        <div className="candidate-list">
+          {visibleCandidateConcepts.map((candidate) => (
+            <article key={candidate.id}>
+              <strong>{candidate.canonicalName}</strong>
+              <span>{ensureFinalKnowledgeCategory(candidate.suggestedCategory, classifyConceptFinalFallback(candidate.canonicalName, candidate.aliases))} · {candidate.source}</span>
+              <p>{candidate.summary || candidate.reason || "等待确认后加入课程知识库。"}</p>
+              <button className="secondary-button small" onClick={() => openCardWithGeneratedFallback(candidate.canonicalName, { category: candidate.suggestedCategory, source: "chat", sourceText: candidate.reason })}>
+                查看卡片
+              </button>
+              <button
+                className="secondary-button small"
+                onClick={() => {
+                  setCandidateMasteryPicker(candidate.normalizedKey);
+                  setCandidateInitialScores((current) => ({ ...current, [candidate.normalizedKey]: current[candidate.normalizedKey] ?? 0.15 }));
+                }}
+              >
+                是，加入知识库
+              </button>
+              <button className="secondary-button small" onClick={() => dismissCandidate(candidate)}>
+                清除
+              </button>
+              {candidateMasteryPicker === candidate.normalizedKey && (
+                <div className="candidate-confirm-panel">
+                  <div className="candidate-confirm-title">设置加入知识库后的初始掌握度</div>
+                  <div className="mastery-choice-grid">
+                    {[
+                      { score: 0.15, label: "陌生 / 需要重点复习" },
+                      { score: 0.35, label: "听过但不稳定" },
+                      { score: 0.55, label: "基本理解，可继续巩固" }
+                    ].map((option) => (
+                      <button
+                        key={option.score}
+                        className={candidateInitialScores[candidate.normalizedKey] === option.score ? "active" : ""}
+                        onClick={() => setCandidateInitialScores((current) => ({ ...current, [candidate.normalizedKey]: option.score }))}
+                      >
+                        <span>{option.label}</span>
+                        <small>{option.score.toFixed(2)}</small>
+                      </button>
+                    ))}
+                  </div>
+                  <div className="candidate-confirm-actions">
+                    <button className="secondary-button small" onClick={() => setCandidateMasteryPicker(null)}>取消</button>
+                    <button
+                      className="primary-button small"
+                      onClick={() =>
+                        addCandidateToCourseKnowledge(
+                          candidate.canonicalName,
+                          candidate.suggestedCategory || "待分类",
+                          candidate.reason || "",
+                          candidateInitialScores[candidate.normalizedKey] ?? 0.15,
+                          undefined,
+                          (candidate.source === "document" ? "manual" : candidate.source)
+                        )
+                      }
+                    >确认加入</button>
+                  </div>
+                </div>
+              )}
+            </article>
+          ))}
+          {hiddenCandidateConceptCount > 0 && (
+            <article className="candidate-list-more">
+              <strong>还有 {hiddenCandidateConceptCount} 个候选</strong>
+              <p>可在资料与知识库的概念管理 / 知识卡片库中查看完整列表。</p>
+            </article>
+          )}
+        </div>
+      </section>
+    );
   };
 
   const handleQuizSubmit = () => {
@@ -2120,6 +2238,7 @@ export default function App() {
             onAddReview={addReviewTask}
             isInReview={isInReview}
           />
+          {renderCandidatePanel("workspace")}
         </div>
       );
     }
@@ -2523,76 +2642,7 @@ export default function App() {
             onAddReview={addReviewTask}
             isInReview={isInReview}
           />
-          {candidateConcepts.length > 0 && (
-            <section className="panel space-candidates">
-              <div className="panel-header compact">
-                <div>
-                  <p className="eyebrow">候选知识点</p>
-                  <h2>待确认后进入共享知识库</h2>
-                </div>
-              </div>
-              <div className="candidate-list">
-                {candidateConcepts.slice(0, 4).map((candidate) => (
-                  <article key={candidate.id}>
-                    <strong>{candidate.canonicalName}</strong>
-                    <p>{candidate.summary || candidate.reason || "待确认新知识点"}</p>
-                    <button className="secondary-button small" onClick={() => openCardWithGeneratedFallback(candidate.canonicalName, { category: candidate.suggestedCategory, source: "chat", sourceText: candidate.reason })}>
-                      查看卡片
-                    </button>
-                    <button
-                      className="secondary-button small"
-                      onClick={() => {
-                        setCandidateMasteryPicker(candidate.normalizedKey);
-                        setCandidateInitialScores((current) => ({ ...current, [candidate.normalizedKey]: current[candidate.normalizedKey] ?? 0.15 }));
-                      }}
-                    >
-                      是，加入知识库
-                    </button>
-                    <button className="secondary-button small" onClick={() => dismissCandidate(candidate)}>
-                      清除
-                    </button>
-                    {candidateMasteryPicker === candidate.normalizedKey && (
-                      <div className="candidate-confirm-panel">
-                        <div className="candidate-confirm-title">你目前对这个知识点的掌握情况是？</div>
-                        <div className="mastery-choice-grid">
-                          {[
-                            { score: 0.15, label: "没听过 / 基本不了解" },
-                            { score: 0.35, label: "听过但不太会用" },
-                            { score: 0.55, label: "鍩烘湰鐞嗚В锛屾兂鍔犲叆澶嶄範" }
-                          ].map((option) => (
-                            <button
-                              key={option.score}
-                              className={candidateInitialScores[candidate.normalizedKey] === option.score ? "active" : ""}
-                              onClick={() => setCandidateInitialScores((current) => ({ ...current, [candidate.normalizedKey]: option.score }))}
-                            >
-                              <span>{option.label}</span>
-                              <small>{option.score.toFixed(2)}</small>
-                            </button>
-                          ))}
-                        </div>
-                        <div className="candidate-confirm-actions">
-                          <button className="secondary-button small" onClick={() => setCandidateMasteryPicker(null)}>取消</button>
-                          <button
-                            className="primary-button small"
-                            onClick={() =>
-                              addCandidateToCourseKnowledge(
-                                candidate.canonicalName,
-                                candidate.suggestedCategory || "待分类",
-                                candidate.reason || "",
-                                candidateInitialScores[candidate.normalizedKey] ?? 0.15,
-                                undefined,
-                                (candidate.source === "document" ? "manual" : candidate.source)
-                              )
-                            }
-                          >确认加入</button>
-                        </div>
-                      </div>
-                    )}
-                  </article>
-                ))}
-              </div>
-            </section>
-          )}
+          {renderCandidatePanel("space")}
         </section>
 
         <aside className="space-right-column">

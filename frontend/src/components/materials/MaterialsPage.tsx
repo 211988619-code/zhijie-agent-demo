@@ -1,6 +1,6 @@
 ﻿import { BookOpenCheck, Brain, CheckCircle2, FileText, Library, MessageCircle, RotateCcw, Search, Trash2, XCircle } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { CandidateConcept, KnowledgeCard, KnowledgeConcept, MasteryRecord, ParsedDocument } from "../../types";
+import type { CandidateConcept, KnowledgeCard, KnowledgeConcept, MasteryRecord, ParsedDocument, UploadState } from "../../types";
 import type { WorkspaceTab } from "../layout/Sidebar";
 import type { RetrievalResult } from "../../services/retrievalService";
 import { normalizeConceptName } from "../../services/knowledgeCardService";
@@ -16,7 +16,7 @@ type Props = {
   temporaryCards: KnowledgeCard[];
   mastery: MasteryRecord[];
   lastRetrievalResults: RetrievalResult[];
-  onParsed: (document: ParsedDocument) => void;
+  onParsed: (document: ParsedDocument, reportProgress?: (state: UploadState) => void) => Promise<void> | void;
   onNavigate: (tab: WorkspaceTab) => void;
   onOpenCard: (conceptName: string) => void;
   onStartKnowledgeCheck: (conceptName: string) => void;
@@ -51,10 +51,61 @@ function candidateSourceLabel(source: CandidateConcept["source"]) {
     quiz: "测验结果",
     quiz_explanation: "测验解析",
     related_concept: "关联概念",
-    document: "\u8bfe\u7a0b\u8d44\u6599"
+    document: "课程资料"
   };
   return labels[source] ?? source;
 }
+
+type MaterialGroup<T> = {
+  category: string;
+  items: T[];
+};
+
+function cleanMaterialCategory(category?: string | null) {
+  const value = String(category ?? "").trim();
+  const lower = value.toLowerCase();
+  if (
+    !value ||
+    ["uncategorized", "unknown", "pending", "pending review", "new concept"].includes(lower) ||
+    value.includes("待确认") ||
+    value.includes("新概念")
+  ) {
+    return "待分类";
+  }
+  return value;
+}
+
+function scoreForName(name: string, mastery: MasteryRecord[]) {
+  return masteryScoreFor(name, mastery) ?? 0.15;
+}
+
+function sortByMasteryThenName<T>(items: T[], getName: (item: T) => string, mastery: MasteryRecord[]) {
+  return [...items].sort((left, right) => {
+    const scoreDelta = scoreForName(getName(left), mastery) - scoreForName(getName(right), mastery);
+    if (scoreDelta !== 0) return scoreDelta;
+    return getName(left).localeCompare(getName(right), "zh-Hans-CN");
+  });
+}
+
+function groupMaterialsByCategory<T>(items: T[], getCategory: (item: T) => string): MaterialGroup<T>[] {
+  const groups = new Map<string, T[]>();
+  items.forEach((item) => {
+    const category = cleanMaterialCategory(getCategory(item));
+    groups.set(category, [...(groups.get(category) ?? []), item]);
+  });
+  return Array.from(groups.entries())
+    .map(([category, groupedItems]) => ({ category, items: groupedItems }))
+    .sort((left, right) => left.category.localeCompare(right.category, "zh-Hans-CN"));
+}
+
+function categoryCollapsed(state: Record<string, boolean>, scope: string, category: string) {
+  return Boolean(state[`${scope}:${category}`]);
+}
+
+function toggleCategoryState(setter: React.Dispatch<React.SetStateAction<Record<string, boolean>>>, scope: string, category: string) {
+  setter((current) => ({ ...current, [`${scope}:${category}`]: !current[`${scope}:${category}`] }));
+}
+
 
 export function MaterialsPage({
   document,
@@ -80,6 +131,23 @@ export function MaterialsPage({
   const confirmedCards = useMemo(() => cards.filter((card) => confirmedKeys.has(card.normalizedKey ?? normalizeConceptName(card.name))), [cards, confirmedKeys]);
   const currentChunks = document.chunks.length;
   const ragReady = currentChunks > 0;
+  const [collapsedMaterialGroups, setCollapsedMaterialGroups] = useState<Record<string, boolean>>({});
+  const confirmedConceptGroups = useMemo(
+    () => groupMaterialsByCategory(sortByMasteryThenName(concepts, (concept) => concept.name, mastery), (concept) => concept.category),
+    [concepts, mastery]
+  );
+  const pendingCandidateGroups = useMemo(
+    () => groupMaterialsByCategory(sortByMasteryThenName(pendingCandidates, (candidate) => candidate.canonicalName, mastery), (candidate) => candidate.suggestedCategory ?? ""),
+    [pendingCandidates, mastery]
+  );
+  const cardGroups = useMemo(
+    () =>
+      groupMaterialsByCategory(
+        sortByMasteryThenName([...cards, ...temporaryCards], (card) => card.name, mastery),
+        (card) => card.category
+      ),
+    [cards, temporaryCards, mastery]
+  );
 
   return (
     <div className="materials-page">
@@ -120,21 +188,33 @@ export function MaterialsPage({
 
       {activeSection === "concepts" && (
         <section className="panel materials-section-panel">
-          <div className="materials-section-header"><div><p className="eyebrow">Concept Manager</p><h2>已确认知识点与候选知识点</h2><span>候选概念可以确认入库，也可以忽略；已确认概念可以从当前知识库移除。</span></div><div className="materials-count-pill">{concepts.length} confirmed · {pendingCandidates.length} pending</div></div>
+          <div className="materials-section-header"><div><p className="eyebrow">Concept Manager</p><h2>按分类管理知识点</h2><span>已确认和候选知识点分区展示，组内按掌握度从低到高排序。</span></div><div className="materials-count-pill">{concepts.length} confirmed · {pendingCandidates.length} pending</div></div>
           <div className="materials-subsection">
             <h3>已确认知识点</h3>
-            <div className="materials-list">
-              {concepts.map((concept) => {
-                const score = masteryScoreFor(concept.name, mastery);
+            <div className="materials-list grouped">
+              {confirmedConceptGroups.map((group) => {
+                const collapsed = categoryCollapsed(collapsedMaterialGroups, "concept", group.category);
+                const avgScore = group.items.reduce((sum, concept) => sum + scoreForName(concept.name, mastery), 0) / Math.max(1, group.items.length);
                 return (
-                  <div className="materials-row" key={concept.id}>
-                    <div className="materials-row-main"><strong>{concept.name}</strong><span>{concept.category} · 掌握度 {typeof score === "number" ? `${Math.round(score * 100)}%` : "未评估"}</span>{concept.reason && <p>{compactText(concept.reason)}</p>}</div>
-                    <div className="materials-row-actions">
-                      <button className="secondary-button small" type="button" onClick={() => onOpenCard(concept.name)}>查看卡片</button>
-                      <button className="secondary-button small" type="button" onClick={() => onStartKnowledgeCheck(concept.name)}>知识检测</button>
-                      <button className="secondary-button small" type="button" onClick={() => onAddReview(concept.name, "knowledge_card")}>加入复习</button>
-                      <button className="secondary-button small danger" type="button" onClick={() => onRemoveConcept(concept)}><Trash2 size={13} />移除</button>
-                    </div>
+                  <div className="materials-category-group" key={`concept-${group.category}`}>
+                    <button className="materials-category-header" type="button" onClick={() => toggleCategoryState(setCollapsedMaterialGroups, "concept", group.category)}>
+                      <span><strong>{group.category}</strong><small>{group.items.length} 项 · 平均掌握度 {Math.round(avgScore * 100)}%</small></span>
+                      <span>{collapsed ? "+" : "-"}</span>
+                    </button>
+                    {!collapsed && group.items.map((concept) => {
+                      const score = masteryScoreFor(concept.name, mastery);
+                      return (
+                        <div className="materials-row" key={concept.id}>
+                          <div className="materials-row-main"><strong>{concept.name}</strong><span>{cleanMaterialCategory(concept.category)} · 掌握度 {typeof score === "number" ? `${Math.round(score * 100)}%` : "未评估"}</span>{concept.reason && <p>{compactText(concept.reason)}</p>}</div>
+                          <div className="materials-row-actions">
+                            <button className="secondary-button small" type="button" onClick={() => onOpenCard(concept.name)}>查看卡片</button>
+                            <button className="secondary-button small" type="button" onClick={() => onStartKnowledgeCheck(concept.name)}>知识检测</button>
+                            <button className="secondary-button small" type="button" onClick={() => onAddReview(concept.name, "knowledge_card")}>加入复习</button>
+                            <button className="secondary-button small danger" type="button" onClick={() => onRemoveConcept(concept)}><Trash2 size={13} />移除</button>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 );
               })}
@@ -143,13 +223,25 @@ export function MaterialsPage({
           </div>
           <div className="materials-subsection">
             <h3>候选知识点</h3>
-            <div className="materials-list">
-              {pendingCandidates.map((candidate) => (
-                <div className="materials-row candidate" key={candidate.id}>
-                  <div className="materials-row-main"><strong>{candidate.canonicalName}</strong><span>{candidate.suggestedCategory ?? "待分类"} · 来源：{candidateSourceLabel(candidate.source)}</span><p>{compactText(candidate.reason ?? candidate.summary ?? "等待确认后加入课程知识库。")}</p></div>
-                  <div className="materials-row-actions"><button className="primary-button small" type="button" onClick={() => onConfirmCandidate(candidate)}><CheckCircle2 size={13} />确认入库</button><button className="secondary-button small" type="button" onClick={() => onRejectCandidate(candidate)}><XCircle size={13} />忽略</button></div>
-                </div>
-              ))}
+            <div className="materials-list grouped">
+              {pendingCandidateGroups.map((group) => {
+                const collapsed = categoryCollapsed(collapsedMaterialGroups, "candidate", group.category);
+                const avgScore = group.items.reduce((sum, candidate) => sum + scoreForName(candidate.canonicalName, mastery), 0) / Math.max(1, group.items.length);
+                return (
+                  <div className="materials-category-group" key={`candidate-${group.category}`}>
+                    <button className="materials-category-header" type="button" onClick={() => toggleCategoryState(setCollapsedMaterialGroups, "candidate", group.category)}>
+                      <span><strong>{group.category}</strong><small>{group.items.length} pending · 平均掌握度 {Math.round(avgScore * 100)}%</small></span>
+                      <span>{collapsed ? "+" : "-"}</span>
+                    </button>
+                    {!collapsed && group.items.map((candidate) => (
+                      <div className="materials-row candidate" key={candidate.id}>
+                        <div className="materials-row-main"><strong>{candidate.canonicalName}</strong><span>{cleanMaterialCategory(candidate.suggestedCategory)} · 来源：{candidateSourceLabel(candidate.source)}</span><p>{compactText(candidate.reason ?? candidate.summary ?? "等待确认后加入课程知识库。")}</p></div>
+                        <div className="materials-row-actions"><button className="primary-button small" type="button" onClick={() => onConfirmCandidate(candidate)}><CheckCircle2 size={13} />确认入库</button><button className="secondary-button small" type="button" onClick={() => onRejectCandidate(candidate)}><XCircle size={13} />忽略</button></div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
               {pendingCandidates.length === 0 && <div className="materials-empty">暂无候选知识点。问答反馈、测验解析或关联概念会出现在这里。</div>}
             </div>
           </div>
@@ -158,14 +250,28 @@ export function MaterialsPage({
 
       {activeSection === "cards" && (
         <section className="panel materials-section-panel">
-          <div className="materials-section-header"><div><p className="eyebrow">Knowledge Card Library</p><h2>知识卡片库</h2><span>已确认卡片用于解释、例题、关联概念和后续复习；临时候选卡片只保留在确认前。</span></div><div className="materials-count-pill">{confirmedCards.length} cards · {temporaryCards.length} temporary</div></div>
-          <div className="materials-list">
-            {[...cards, ...temporaryCards].map((card) => (
-              <div className={`materials-row ${card.status === "temporary" ? "candidate" : ""}`} key={card.id}>
-                <div className="materials-row-main"><strong>{card.name}</strong><span>{card.category} · {card.generatedBy ?? "manual"} · {card.source}</span><p>{compactText(card.summary)}</p></div>
-                <div className="materials-row-actions"><button className="secondary-button small" type="button" onClick={() => onOpenCard(card.name)}>查看卡片</button><button className="secondary-button small" type="button" onClick={() => onStartKnowledgeCheck(card.name)}>知识检测</button>{card.status !== "temporary" && <button className="secondary-button small" type="button" onClick={() => onAddReview(card.name, "knowledge_card")}>加入复习</button>}<button className="secondary-button small danger" type="button" onClick={() => onRemoveCard(card)}><Trash2 size={13} />删除</button></div>
-              </div>
-            ))}
+          <div className="materials-section-header"><div><p className="eyebrow">Knowledge Card Library</p><h2>知识卡片库</h2><span>已确认卡片和临时候选卡片按分类统一管理。</span></div><div className="materials-count-pill">{confirmedCards.length} cards · {temporaryCards.length} temporary</div></div>
+          <div className="materials-list grouped">
+            {cardGroups.map((group) => {
+              const collapsed = categoryCollapsed(collapsedMaterialGroups, "card", group.category);
+              const confirmedCount = group.items.filter((card) => card.status !== "temporary").length;
+              const temporaryCount = group.items.filter((card) => card.status === "temporary").length;
+              const avgScore = group.items.reduce((sum, card) => sum + scoreForName(card.name, mastery), 0) / Math.max(1, group.items.length);
+              return (
+                <div className="materials-category-group" key={`card-${group.category}`}>
+                  <button className="materials-category-header" type="button" onClick={() => toggleCategoryState(setCollapsedMaterialGroups, "card", group.category)}>
+                    <span><strong>{group.category}</strong><small>{confirmedCount} cards · {temporaryCount} temporary · 平均掌握度 {Math.round(avgScore * 100)}%</small></span>
+                    <span>{collapsed ? "+" : "-"}</span>
+                  </button>
+                  {!collapsed && group.items.map((card) => (
+                    <div className={`materials-row ${card.status === "temporary" ? "candidate" : ""}`} key={card.id}>
+                      <div className="materials-row-main"><strong>{card.name}</strong><span>{cleanMaterialCategory(card.category)} · {card.generatedBy ?? "manual"} · {card.source}</span><p>{compactText(card.summary)}</p></div>
+                      <div className="materials-row-actions"><button className="secondary-button small" type="button" onClick={() => onOpenCard(card.name)}>查看卡片</button><button className="secondary-button small" type="button" onClick={() => onStartKnowledgeCheck(card.name)}>知识检测</button>{card.status !== "temporary" && <button className="secondary-button small" type="button" onClick={() => onAddReview(card.name, "knowledge_card")}>加入复习</button>}<button className="secondary-button small danger" type="button" onClick={() => onRemoveCard(card)}><Trash2 size={13} />移除</button></div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
             {cards.length + temporaryCards.length === 0 && <div className="materials-empty">暂无知识卡片。</div>}
           </div>
         </section>

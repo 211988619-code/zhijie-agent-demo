@@ -4,7 +4,7 @@ import type { ParsedDocument, UploadState } from "../types";
 import { parseDocumentFile } from "../services/documentParser";
 
 type Props = {
-  onParsed: (document: ParsedDocument) => void;
+  onParsed: (document: ParsedDocument, reportProgress?: (state: UploadState) => void) => Promise<void> | void;
 };
 
 export function FileUploader({ onParsed }: Props) {
@@ -21,7 +21,7 @@ export function FileUploader({ onParsed }: Props) {
     setState({ progress: 4, status: "reading", message: `读取 ${file.name}` });
     try {
       const parsed = await parseDocumentFile(file, setState);
-      onParsed(parsed);
+      await onParsed(parsed, setState);
     } catch (error) {
       setState({ progress: 100, status: "failed", message: error instanceof Error ? error.message : "解析失败" });
     }

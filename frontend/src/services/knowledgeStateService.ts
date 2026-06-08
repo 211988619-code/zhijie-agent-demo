@@ -34,6 +34,29 @@ export function isPendingCategoryLabel(category?: string | null) {
   return sanitizeKnowledgeCategory(category) === "\u5f85\u5206\u7c7b";
 }
 
+export function isInvalidFinalCategory(category?: string | null) {
+  const value = String(category ?? "").trim();
+  if (!value) return true;
+  const normalized = value.toLowerCase();
+  return (
+    isPendingCategoryLabel(value) ||
+    ["uncategorized", "unknown", "pending", "pending review", "new concept"].includes(normalized) ||
+    value.includes("\u5f85\u5206\u7c7b") ||
+    value.includes("\u5f85\u786e\u8ba4") ||
+    value.includes("\u65b0\u6982\u5ff5")
+  );
+}
+
+export function ensureFinalKnowledgeCategory(category?: string | null, fallback = "\u8ba1\u7b97\u673a\u57fa\u7840") {
+  const sanitized = sanitizeKnowledgeCategory(category);
+  if (isInvalidFinalCategory(sanitized)) return fallback;
+  return sanitized;
+}
+
+export function classifyConceptFinalFallback(conceptName: string, aliases: string[] = []) {
+  return ensureFinalKnowledgeCategory(classifyConceptFallback(conceptName, aliases), "\u8ba1\u7b97\u673a\u57fa\u7840");
+}
+
 type CandidateInput = NewConceptCandidate | {
   name: string;
   category?: string;

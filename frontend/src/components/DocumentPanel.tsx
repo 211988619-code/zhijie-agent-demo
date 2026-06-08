@@ -1,12 +1,12 @@
 import { CheckCircle2, ChevronDown, FileText, Search, AlertTriangle } from "lucide-react";
 import { useState } from "react";
-import type { ConceptId, ParsedDocument } from "../types";
+import type { ConceptId, ParsedDocument, UploadState } from "../types";
 import { FileUploader } from "./FileUploader";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 
 type Props = {
   document: ParsedDocument;
-  onParsed: (document: ParsedDocument) => void;
+  onParsed: (document: ParsedDocument, reportProgress?: (state: UploadState) => void) => Promise<void> | void;
   onOpenCard: (conceptId: ConceptId) => void;
 };
 

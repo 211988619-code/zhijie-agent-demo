@@ -229,20 +229,19 @@ export async function parseDocumentFile(file: File, onState?: (state: UploadStat
 
   if (!text.trim()) throw new Error("文件解析完成，但没有提取到文本内容。");
 
-  onState?.({ progress: 72, status: "parsing", message: "正在抽取知识点并切分片段..." });
-  const concepts = extractConcepts(text);
-  const chunks = splitIntoChunks(text, file.name, concepts.length > 0 ? concepts : initialConcepts);
-  if (chunks.length === 0) throw new Error("已提取文本，但未能生成可用片段。");
-  onState?.({ progress: 100, status: "ready", message: `解析成功：生成 ${chunks.length} 个片段，抽取 ${concepts.length} 个知识点。` });
+  onState?.({ progress: 52, status: "parsing", message: "Splitting document into chunks..." });
+  const chunks = splitIntoChunks(text, file.name, initialConcepts);
+  if (chunks.length === 0) throw new Error("Document text was extracted, but no usable chunks were generated.");
+  onState?.({ progress: 58, status: "parsing", message: "Chunks ready; preparing LLM concept extraction..." });
 
   return {
     id: `doc_${Date.now()}`,
     fileName: file.name,
     fileType: extension.replace(".", ""),
-    status: "ready",
+    status: "partial",
     text,
     chunks,
-    concepts,
+    concepts: [],
     updatedAt: new Date().toLocaleString()
   };
 }
