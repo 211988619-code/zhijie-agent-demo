@@ -358,8 +358,8 @@ export default function App() {
   const appMenuCloseTimerRef = useRef<number | null>(null);
   const knowledgeSyncGuardRef = useRef(false);
 
-  const [config, setConfig] = useState<LLMConfig>(() => ({ ...defaultConfig, ...readLocal<Partial<LLMConfig>>(MODEL_CONFIG_STORAGE_KEY, {}) }));
-  const [modelStatus, setModelStatus] = useState<ModelConnectionStatus>(() => (readLocal<Partial<LLMConfig>>(MODEL_CONFIG_STORAGE_KEY, {}).apiKey ? "mock" : "missing-key"));
+  const [config, setConfig] = useState<LLMConfig>(defaultConfig);
+  const [modelStatus, setModelStatus] = useState<ModelConnectionStatus>("mock");
   const [lastModelError, setLastModelError] = useState("");
   const connected = modelStatus === "ready";
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -475,7 +475,10 @@ export default function App() {
   useEffect(() => writeLocal("agentSessionInputs", sessionInputs), [sessionInputs]);
   useEffect(() => writeLocal("agentSessionTrace", sessionTrace), [sessionTrace]);
   useEffect(() => writeLocal("lastVisitedMainPage", lastVisitedMainPage), [lastVisitedMainPage]);
-  useEffect(() => writeLocal(MODEL_CONFIG_STORAGE_KEY, config), [config]);
+  useEffect(() => {
+    // Remove credentials saved by older frontend-only versions.
+    localStorage.removeItem(MODEL_CONFIG_STORAGE_KEY);
+  }, []);
 
   useEffect(() => {
     if (knowledgeSyncGuardRef.current) return;

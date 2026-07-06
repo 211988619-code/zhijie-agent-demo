@@ -20,6 +20,7 @@ import type { RetrievalResult } from "./retrievalService";
 import { describeRetrievalResult } from "./retrievalService";
 import { processConceptExtraction } from "./conceptExtractionService";
 import { classifyConceptFallback, classifyConceptFinalFallback, ensureFinalKnowledgeCategory, isInvalidFinalCategory, isPendingCategoryLabel, sanitizeKnowledgeCategory } from "./knowledgeStateService";
+import { getModelHealth, postAgentChat } from "../api/client";
 
 export type StructuredLLMResult = {
   answer: AgentAnswer;
@@ -389,114 +390,24 @@ $$
   return normalizeLLMResult(raw, "mock", sources);
 }
 
-function isDeepSeekV4(config: LLMConfig, model: string) {
-  return config.provider === "deepseek" && /^deepseek-v4-(pro|flash)$/i.test(model);
-}
-
-function normalizeRequestModel(config: LLMConfig, model: string) {
-  if (config.provider === "dashscope" && /^GLM-5$/i.test(model)) return "glm-5";
-  return model;
-}
-
-function providerSupportsJsonMode(config: LLMConfig) {
-  return ["openai", "deepseek", "dashscope", "zhipu", "openai-compatible"].includes(config.provider);
-}
-
-function buildRequestBody(config: LLMConfig, model: string, messages: Array<{ role: string; content: string }>, maxTokens?: number, jsonMode = false) {
-  const body: Record<string, unknown> = {
-    model,
-    messages,
-    stream: false
-  };
-
-  if (maxTokens) body.max_tokens = maxTokens;
-  if (jsonMode && providerSupportsJsonMode(config)) body.response_format = { type: "json_object" };
-
-  if (isDeepSeekV4(config, model)) {
-    // DeepSeek V4 defaults to thinking mode. This Demo needs direct structured JSON,
-    // so disable thinking to avoid responses with reasoning_content but empty content.
-    body.thinking = { type: "disabled" };
-  } else {
-    body.temperature = config.temperature ?? 0.3;
-  }
-
-  return body;
-}
-
-function getChatCompletionsUrl(config: LLMConfig, baseUrl: string, model: string) {
-  const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, "");
-  if (/\/chat\/completions$/i.test(normalizedBaseUrl)) return normalizedBaseUrl;
-  if (isDeepSeekV4(config, model) && /^https:\/\/api\.deepseek\.com\/v1\/?$/i.test(normalizedBaseUrl)) {
-    return "https://api.deepseek.com/chat/completions";
-  }
-  return `${normalizedBaseUrl}/chat/completions`;
-}
-
-function formatHttpError(status: number, message: string) {
-  if (status === 401) return `401 Unauthorized: invalid or unauthorized API Key. ${message}`;
-  if (status === 404) return `404 Not Found: Base URL or model may be wrong. ${message}`;
-  if (status === 429) return `429 Rate Limit: too many requests or insufficient quota. ${message}`;
-  return `HTTP ${status}: ${message}`;
-}
-function extractErrorMessage(json: unknown): string | null {
-  if (!json || typeof json !== "object") return null;
-  const data = json as Record<string, unknown>;
-  const error = data.error;
-  if (error && typeof error === "object") {
-    const message = (error as Record<string, unknown>).message;
-    if (typeof message === "string") return message;
-  }
-  if (typeof data.message === "string") return data.message;
-  return null;
-}
-
 async function postChatCompletions(config: LLMConfig, messages: Array<{ role: string; content: string }>, maxTokens?: number, jsonMode = false) {
-  const defaults = getProviderDefaults(config.provider);
-  const baseUrl = (config.baseUrl || defaults.baseUrl).trim().replace(/\/+$/, "");
-  const model = normalizeRequestModel(config, config.model || defaults.model);
-  if (!baseUrl || !model) throw new Error("Missing Base URL or Model Name.");
-
-  let response: Response;
   try {
-    response = await fetch(getChatCompletionsUrl(config, baseUrl, model), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.apiKey}`
-      },
-      body: JSON.stringify(buildRequestBody(config, model, messages, maxTokens, jsonMode))
+    const response = await postAgentChat({
+      messages: messages.map((message) => ({
+        role: message.role === "assistant" || message.role === "system" ? message.role : "user",
+        content: message.content
+      })),
+      metadata: { source: "assistant", maxTokens, jsonMode, temperature: config.temperature ?? 0.3 }
     });
+    if (response.mode === "mock") {
+      const reason = response.fallbackReason ? `[${response.fallbackReason}] ` : "";
+      throw new Error(`${reason}${response.warning || "Backend selected mock fallback."}`);
+    }
+    if (!response.answer.trim()) throw new Error("Backend response is empty.");
+    return response.answer;
   } catch (error) {
-    throw new Error(
-      `Network/CORS Error: request did not reach the model service. Browser direct access may be blocked by CORS; use a backend proxy later. ${error instanceof Error ? error.message : ""}`
-    );
+    throw new Error(`Backend Chat Proxy error: ${error instanceof Error ? error.message : "unknown error"}`);
   }
-
-  const rawText = await response.text();
-  let json: unknown;
-  try {
-    json = JSON.parse(rawText);
-  } catch {
-    throw new Error(`Model returned non-JSON response: ${rawText.slice(0, 240)}`);
-  }
-
-  const errorMessage = extractErrorMessage(json);
-  if (jsonMode && !response.ok && /response_format|json[_ -]?mode|unsupported|not support/i.test(errorMessage ?? rawText)) {
-    return postChatCompletions(config, messages, maxTokens, false);
-  }
-  if (!response.ok || errorMessage) {
-    throw new Error(formatHttpError(response.status, errorMessage ?? rawText.slice(0, 240)));
-  }
-
-  const data = json as Record<string, any>;
-  const message = data?.choices?.[0]?.message;
-  const content = message?.content;
-  const reasoningContent = message?.reasoning_content;
-  if ((!content || typeof content !== "string") && reasoningContent) {
-    throw new Error("Model returned reasoning_content but no final content. Thinking mode or token limit may be the cause.");
-  }
-  if (!content || typeof content !== "string") throw new Error("Model response is empty: missing choices[0].message.content.");
-  return content;
 }
 
 const STRUCTURED_JSON_MAX_ATTEMPTS = 2;
@@ -713,11 +624,6 @@ export async function callLLMAgent(
   mastery: MasteryRecord[],
   contextChunks?: RetrievalResult[]
 ): Promise<StructuredLLMResult> {
-  if (!config.apiKey.trim()) {
-    if (config.useMockFallback) return buildMockAgentResponse(question, chunks, concepts, mastery, "Missing API Key, using mock fallback.");
-    throw new Error("Please configure API Key in Settings, or enable mock fallback.");
-  }
-
   try {
     const materialTrace: AgentTraceStep | null = contextChunks
       ? {
@@ -738,7 +644,7 @@ export async function callLLMAgent(
       title: "Real API",
       type: "llm_call",
       status: "success",
-      detail: `${config.provider} / ${config.model || getProviderDefaults(config.provider).model}`
+      detail: "FastAPI /agent/chat → backend-managed model"
     };
     try {
       const structured = await callStructuredJson({
@@ -756,6 +662,7 @@ export async function callLLMAgent(
       result.trace = [realApiTrace, ...(materialTrace ? [materialTrace] : []), ...repairTrace, ...result.trace];
       return result;
     } catch (parseError) {
+      if (parseError instanceof Error && parseError.message.includes("Backend Chat Proxy error")) throw parseError;
       const result = safeStructuredFallbackAnswer(sourceRefsFromRetrieval(contextChunks, chunks), parseError instanceof Error ? parseError.message : "JSON repair failed.");
       result.trace = [realApiTrace, ...(materialTrace ? [materialTrace] : []), ...result.trace];
       return result;
@@ -1150,9 +1057,9 @@ export async function extractDocumentConceptsWithLLM(params: {
 }
 
 export async function testLLMConnection(config: LLMConfig): Promise<string> {
-  if (!config.apiKey.trim()) throw new Error("请先填写 API Key。");
-  const defaults = getProviderDefaults(config.provider);
-  const model = config.model || defaults.model;
-  await postChatCompletions(config, [{ role: "user", content: "请只回答 OK，用于连接测试。" }], isDeepSeekV4(config, model) ? 128 : 32);
-  return `${model} 连接成功`;
+  void config;
+  const health = await getModelHealth();
+  if (health.modelReachable) return "后端已连接，真实模型调用成功。";
+  const reason = health.fallbackReason ? `[${health.fallbackReason}] ` : "";
+  throw new Error(`${reason}${health.detail}`);
 }
